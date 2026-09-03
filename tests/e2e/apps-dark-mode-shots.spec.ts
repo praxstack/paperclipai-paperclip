@@ -15,8 +15,6 @@ async function newCompany(request: APIRequestContext, label: string): Promise<Se
   const res = await request.post("/api/companies", { data: { name: `Apps navigation ${label} ${Date.now()}` } });
   expect(res.ok(), `create company failed ${res.status()}: ${await res.text()}`).toBe(true);
   const company = await res.json();
-  const flags = await request.patch("/api/instance/settings/experimental", { data: { enableApps: true } });
-  expect(flags.ok(), `enable apps failed ${flags.status()}: ${await flags.text()}`).toBe(true);
   return {
     companyId: company.id,
     prefix: company.issuePrefix ?? company.prefix ?? company.urlKey ?? "E2E",
@@ -163,7 +161,7 @@ test.describe.serial("dark-mode Apps surfaces", () => {
     await expect(page.locator('a[href$="/apps/advanced/gateways"]', { hasText: "Gateways" })).toHaveCount(0);
     await expect(page.locator('a[href$="/apps/advanced/profiles"]', { hasText: "Profiles" })).toHaveCount(0);
     await expect(page.locator('a[href$="/apps/advanced/audit"]', { hasText: "Activity" })).toHaveCount(0);
-    await expect(page.locator('a[href$="/activity"]', { hasText: "Activity" })).toBeVisible();
+    await expect(page.locator('a[href$="/activity"]', { hasText: "Audit" })).toBeVisible();
     await expect(page.getByRole("link", { name: "Applications", exact: true })).toHaveCount(0);
     // Apps section lives in the same sidebar now.
     await expect(page.locator('a[href$="/apps"]', { hasText: "Connectors" })).toBeVisible();

@@ -6,6 +6,7 @@ import type {
 import type { CodexAppServerTransport } from "../drivers/codex/app-server-transport.js";
 import {
   createCodexNativeSessionBackend,
+  createRunnerdNativeSessionBackend,
   type CodexNativeSessionBackendOptions,
 } from "./codex-native-backend.js";
 import {
@@ -39,6 +40,16 @@ export function createNativeSessionBackend(
   input: NativeExecutionInput,
   options: NativeBackendFactoryOptions = {},
 ): NativeSessionBackend {
+  if (options.codexTransportFactory) {
+    return createRunnerdNativeSessionBackend(input, {
+      runnerInstanceId: options.runnerInstanceId,
+      onSpawn: options.onSpawn,
+      dynamicTools: options.dynamicTools,
+      dynamicToolHandler: options.dynamicToolHandler,
+      environment: options.environment,
+      transportFactory: options.codexTransportFactory,
+    });
+  }
   if (input.provider.kind === "opencode") {
     if (!options.opencodeRuntimeDirectory?.trim()) {
       throw new Error(
@@ -88,6 +99,7 @@ export function createNativeSessionBackend(
     onSpawn: options.onSpawn,
     dynamicTools: options.dynamicTools,
     dynamicToolHandler: options.dynamicToolHandler,
+    environment: options.environment,
     transportFactory: options.codexTransportFactory,
   });
 }
