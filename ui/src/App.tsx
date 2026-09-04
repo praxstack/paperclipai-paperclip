@@ -71,6 +71,7 @@ import { canEnterAppsConnect } from "./pages/apps/app-connect-policy";
 import { AppsReview } from "./pages/apps/AppsReview";
 import { AppDetail } from "./pages/apps/AppDetail";
 import { AppNotConnected } from "./pages/apps/AppNotConnected";
+import { PaperclipCloudOAuthHandoffPage } from "./pages/apps/PaperclipCloudOAuthHandoff";
 import { GatewaysList } from "./pages/apps/gateways/GatewaysList";
 import { GatewayDetail } from "./pages/apps/gateways/GatewayDetail";
 import { CompanySkills } from "./pages/CompanySkills";
@@ -215,7 +216,7 @@ function boardRoutes(streamlinedUiEnabled: boolean) {
       <Route path="apps/advanced/:tab" element={<AdvancedToolsRoute />} />
       <Route path="apps/app/:applicationId" element={<AppNotConnected />} />
       <Route path="apps/app/:applicationId/:tab" element={<AppNotConnected />} />
-      <Route path="apps/:connectionId" element={<Navigate to="setup" replace />} />
+      <Route path="apps/:connectionId" element={<Navigate to="permissions" replace />} />
       <Route path="apps/:connectionId/:tab" element={<AppDetail />} />
       <Route path="company/settings/instance" element={<Navigate to="/company/settings" replace />} />
       <Route element={<HiddenSettingsPageGate pageKey="instance.profile" />}>
@@ -729,6 +730,7 @@ export function App() {
   return (
     <>
       <Routes>
+        <Route path="oauth-handoff" element={<PaperclipCloudOAuthHandoffPage />} />
         <Route path="auth" element={<AuthPage />} />
         <Route path="board-claim/:token" element={<BoardClaimPage />} />
         <Route path="cli-auth/:id" element={<CliAuthPage />} />
