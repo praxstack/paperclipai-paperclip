@@ -196,7 +196,9 @@ describe("runner E2E report aggregation", () => {
     expect(dashboard).toContain(
       "Visual evidence is retained in the access-controlled workflow artifact",
     );
-    expect(dashboard).toContain("Public history excludes visual evidence");
+    expect(dashboard).toContain(
+      "Public history excludes provider-produced visual evidence",
+    );
     expect(dashboard).toContain("message_contains");
     expect(dashboard).toContain("Matchers and test context");
     expect(dashboard).toContain("Campaign billing summary");
@@ -210,13 +212,26 @@ describe("runner E2E report aggregation", () => {
     expect(dashboard).toContain('class="mobile-environment-header"');
     expect(dashboard).toContain("data-gallery-profile=");
     expect(dashboard).toContain("data-gallery-environment=");
+    expect(dashboard).toContain("data-gallery-duration=");
+    expect(dashboard).toContain("data-gallery-tokens=");
+    expect(dashboard).toContain("data-gallery-matchers=");
+    expect(dashboard).toContain("data-report-query");
+    expect(dashboard).toContain("data-report-profile");
+    expect(dashboard).toContain("data-report-environment");
+    expect(dashboard).toContain("data-report-status");
+    expect(dashboard.indexOf('class="report-filters"')).toBeGreaterThan(
+      dashboard.indexOf('class="suite-nav"'),
+    );
+    expect(dashboard).not.toContain(".report-filters { position: sticky");
+    expect(dashboard).toContain("table-layout: fixed");
+    expect(dashboard).toContain('class="profile-column"');
     expect(dashboard).toContain('aria-label="Previous"');
     expect(dashboard).toContain('aria-label="Next"');
     expect(dashboard).not.toContain("overflow: auto; max-height: calc(100vh");
     expect(dashboard).toContain("@media (max-width: 1180px)");
     expect(
-      await readFile(path.join(output, "assets", "favicon.svg"), "utf8"),
-    ).toContain("<svg");
+      await readFile(path.join(output, "assets", "favicon-32x32.png")),
+    ).not.toHaveLength(0);
     expect(
       await readFile(path.join(output, "assets", "InterVariable.woff2")),
     ).not.toHaveLength(0);
