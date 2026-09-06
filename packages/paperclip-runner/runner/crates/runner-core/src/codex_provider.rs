@@ -54,7 +54,7 @@ pub(crate) const MAX_SETTLED_PROVIDER_TURN_IDS: usize = 4_096;
 type QuestionOptionLabels = BTreeMap<String, BTreeMap<String, String>>;
 type QuestionSetMapping = (String, Value, QuestionOptionLabels);
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct ProviderCompletionContract {
     revision: String,
     criterion_ids: Vec<String>,
@@ -531,6 +531,103 @@ pub struct CodexProvider {
     last_trace_frame_id: Option<u64>,
     opencode_launch_profile: Option<OpenCodeLaunchProfile>,
     completion_contract: Option<ProviderCompletionContract>,
+    permission_profile: &'static str,
+}
+
+// The controller accepts at most 32 process-scoped Git config entries and
+// projects only these exact GitHub credential names into runnerd. Keep the
+// provider child boundary equally explicit: runnerd may inherit a configured
+// entry from this static ceiling, but cannot introduce another environment
+// variable by changing GIT_CONFIG_COUNT.
+const GITHUB_CREDENTIAL_ENVIRONMENT_KEYS: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "PAPERCLIP_GIT_TOKEN",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_CONFIG_COUNT",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_KEY_1",
+    "GIT_CONFIG_VALUE_1",
+    "GIT_CONFIG_KEY_2",
+    "GIT_CONFIG_VALUE_2",
+    "GIT_CONFIG_KEY_3",
+    "GIT_CONFIG_VALUE_3",
+    "GIT_CONFIG_KEY_4",
+    "GIT_CONFIG_VALUE_4",
+    "GIT_CONFIG_KEY_5",
+    "GIT_CONFIG_VALUE_5",
+    "GIT_CONFIG_KEY_6",
+    "GIT_CONFIG_VALUE_6",
+    "GIT_CONFIG_KEY_7",
+    "GIT_CONFIG_VALUE_7",
+    "GIT_CONFIG_KEY_8",
+    "GIT_CONFIG_VALUE_8",
+    "GIT_CONFIG_KEY_9",
+    "GIT_CONFIG_VALUE_9",
+    "GIT_CONFIG_KEY_10",
+    "GIT_CONFIG_VALUE_10",
+    "GIT_CONFIG_KEY_11",
+    "GIT_CONFIG_VALUE_11",
+    "GIT_CONFIG_KEY_12",
+    "GIT_CONFIG_VALUE_12",
+    "GIT_CONFIG_KEY_13",
+    "GIT_CONFIG_VALUE_13",
+    "GIT_CONFIG_KEY_14",
+    "GIT_CONFIG_VALUE_14",
+    "GIT_CONFIG_KEY_15",
+    "GIT_CONFIG_VALUE_15",
+    "GIT_CONFIG_KEY_16",
+    "GIT_CONFIG_VALUE_16",
+    "GIT_CONFIG_KEY_17",
+    "GIT_CONFIG_VALUE_17",
+    "GIT_CONFIG_KEY_18",
+    "GIT_CONFIG_VALUE_18",
+    "GIT_CONFIG_KEY_19",
+    "GIT_CONFIG_VALUE_19",
+    "GIT_CONFIG_KEY_20",
+    "GIT_CONFIG_VALUE_20",
+    "GIT_CONFIG_KEY_21",
+    "GIT_CONFIG_VALUE_21",
+    "GIT_CONFIG_KEY_22",
+    "GIT_CONFIG_VALUE_22",
+    "GIT_CONFIG_KEY_23",
+    "GIT_CONFIG_VALUE_23",
+    "GIT_CONFIG_KEY_24",
+    "GIT_CONFIG_VALUE_24",
+    "GIT_CONFIG_KEY_25",
+    "GIT_CONFIG_VALUE_25",
+    "GIT_CONFIG_KEY_26",
+    "GIT_CONFIG_VALUE_26",
+    "GIT_CONFIG_KEY_27",
+    "GIT_CONFIG_VALUE_27",
+    "GIT_CONFIG_KEY_28",
+    "GIT_CONFIG_VALUE_28",
+    "GIT_CONFIG_KEY_29",
+    "GIT_CONFIG_VALUE_29",
+    "GIT_CONFIG_KEY_30",
+    "GIT_CONFIG_VALUE_30",
+    "GIT_CONFIG_KEY_31",
+    "GIT_CONFIG_VALUE_31",
+];
+
+const CODEX_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
+    "CODEX_HOME",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "PAPERCLIP_RUNNER_EXTERNAL_SANDBOX",
+];
+
+fn codex_permission_profile(provider: &str, external_sandbox: bool) -> &'static str {
+    if provider == "codex" && external_sandbox {
+        "paperclip-runner-external-sandbox"
+    } else {
+        "paperclip-runner-workspace-only"
+    }
 }
 
 impl CodexProvider {
@@ -578,6 +675,10 @@ impl CodexProvider {
             ));
         }
         let authorized_tools = authorized_tools.into_iter().collect::<Vec<_>>();
+        let permission_profile = codex_permission_profile(
+            &config.provider,
+            std::env::var("PAPERCLIP_RUNNER_EXTERNAL_SANDBOX").as_deref() == Ok("1"),
+        );
         let (dynamic_tools, authorized_tool_ids) =
             codex_dynamic_tools(authorized_tools.iter().cloned())?;
         let common_environment_keys = [
@@ -598,12 +699,13 @@ impl CodexProvider {
         let provider_environment_keys = if config.provider == "opencode" {
             OPENCODE_PROVIDER_ENVIRONMENT_KEYS
         } else {
-            &["CODEX_HOME", "OPENAI_API_KEY", "CODEX_API_KEY"][..]
+            CODEX_PROVIDER_ENVIRONMENT_KEYS
         };
         let environment_keys = common_environment_keys
             .iter()
             .copied()
             .chain(provider_environment_keys.iter().copied())
+            .chain(GITHUB_CREDENTIAL_ENVIRONMENT_KEYS.iter().copied())
             .collect::<Vec<_>>();
         let process = if config.provider == "opencode" {
             let profile = opencode_launch_profile.ok_or_else(|| {
@@ -676,6 +778,7 @@ impl CodexProvider {
                     criterion_ids: criterion_ids.to_vec(),
                 }
             }),
+            permission_profile,
         };
         let initialized = provider.request(
             "initialize",
@@ -697,7 +800,7 @@ impl CodexProvider {
             "cwd": config.cwd,
             "model": config.model,
             "approvalPolicy": config.approval_policy,
-            "permissions": "paperclip-runner-workspace-only",
+            "permissions": provider.permission_profile,
             "runtimeWorkspaceRoots": [config.cwd],
             "baseInstructions": config.instructions,
             "dynamicTools": dynamic_tools,
@@ -805,6 +908,46 @@ impl CodexProvider {
         // against its persisted receipt before returning a stored result.
         // Direct provider consumers retain the stricter one-shot behavior.
         self.durable_tool_call_replays = true;
+    }
+
+    pub(crate) fn attach_run_in_place(
+        &mut self,
+        authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
+        completion_contract: Option<(&str, &[String])>,
+    ) -> Result<bool, LocalRunnerError> {
+        let authorized_tools = authorized_tools.into_iter().collect::<Vec<_>>();
+        let completion_contract =
+            completion_contract.map(|(revision, criterion_ids)| ProviderCompletionContract {
+                revision: revision.to_owned(),
+                criterion_ids: criterion_ids.to_vec(),
+            });
+        if authorized_tools != self.authorized_tools
+            || completion_contract != self.completion_contract
+        {
+            return Ok(false);
+        }
+        if self.process.try_wait()?.is_some()
+            || self.quarantined
+            || self.active_provider_turn_id.is_some()
+            || self.ambiguous_turn_start_pending
+            || !self.pending_messages.is_empty()
+            || !self.deferred_ambiguous_messages.is_empty()
+            || !self.pending_tool_requests.is_empty()
+            || !self.pending_runtime_requests.is_empty()
+        {
+            return Err(LocalRunnerError::invalid(
+                "Codex warm run attachment requires an idle live provider with no pending work",
+            ));
+        }
+        // The provider process and its thread remain authoritative. Exact
+        // settled-turn identities stay in memory so delayed output from an
+        // earlier run cannot be accepted as the next turn. A changed semantic
+        // tool or completion contract returns false so the caller can preserve
+        // the existing cold-resume behavior for that incompatible boundary.
+        self.completed_turn_authority = None;
+        self.completion_reconciliation_pending = false;
+        self.expected_shutdown = false;
+        Ok(true)
     }
 
     pub(crate) fn restore_completed_turn_authority(
@@ -973,7 +1116,7 @@ impl CodexProvider {
             json!({
                 "threadId": self.thread_id,
                 "cwd": cwd,
-                "permissions": "paperclip-runner-workspace-only",
+                "permissions": self.permission_profile,
                 "runtimeWorkspaceRoots": [cwd],
                 "input": [{"type": "text", "text": message, "text_elements": []}],
             }),
@@ -2800,6 +2943,48 @@ mod tests {
     #[test]
     fn does_not_forward_an_ambient_opencode_command_override() {
         assert!(!OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_OPENCODE_COMMAND"));
+    }
+
+    #[test]
+    fn github_credentials_cross_only_the_bounded_provider_environment() {
+        assert_eq!(GITHUB_CREDENTIAL_ENVIRONMENT_KEYS.len(), 73);
+        for key in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "PAPERCLIP_GIT_TOKEN",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_CONFIG_COUNT",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_KEY_31",
+            "GIT_CONFIG_VALUE_31",
+        ] {
+            assert!(GITHUB_CREDENTIAL_ENVIRONMENT_KEYS.contains(&key));
+        }
+        assert!(!GITHUB_CREDENTIAL_ENVIRONMENT_KEYS.contains(&"GIT_CONFIG_KEY_32"));
+        assert!(!GITHUB_CREDENTIAL_ENVIRONMENT_KEYS.contains(&"GIT_CONFIG_VALUE_32"));
+    }
+
+    #[test]
+    fn codex_provider_accepts_only_the_controller_derived_external_sandbox_bit() {
+        assert!(CODEX_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_RUNNER_EXTERNAL_SANDBOX"));
+        assert!(!CODEX_PROVIDER_ENVIRONMENT_KEYS.contains(&"PAPERCLIP_SANDBOX_MODE"));
+        assert_eq!(
+            codex_permission_profile("codex", true),
+            "paperclip-runner-external-sandbox"
+        );
+        assert_eq!(
+            codex_permission_profile("codex", false),
+            "paperclip-runner-workspace-only"
+        );
+        assert_eq!(
+            codex_permission_profile("opencode", true),
+            "paperclip-runner-workspace-only"
+        );
     }
 
     #[test]

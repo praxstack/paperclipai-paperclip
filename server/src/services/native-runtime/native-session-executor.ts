@@ -2623,7 +2623,13 @@ export async function nativeProviderRecoveryEvidence(input: {
   const durableEvents = await input.db
     .select({ eventType: heartbeatRunEvents.eventType })
     .from(heartbeatRunEvents)
-    .where(eq(heartbeatRunEvents.runId, input.runId));
+    .where(
+      and(
+        eq(heartbeatRunEvents.runId, input.runId),
+        inArray(heartbeatRunEvents.eventType, [...PROVIDER_DURABLE_EVENT_TYPES]),
+      ),
+    )
+    .limit(1);
   const providerEventsExist = durableEvents.some((event) =>
     PROVIDER_DURABLE_EVENT_TYPES.has(event.eventType),
   );
@@ -4171,23 +4177,7 @@ async function executePaperclipNativeSessionWithinScope(
         entry.busy = true;
         if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
         entry.idleTimer = null;
-        if (input.useRunnerd) {
-          // A retained driver closes over the tool authority from the run that
-          // created it. Preserve provider continuity through its durable
-          // checkpoint, but rebuild the runnerd backend so the next run gets a
-          // fresh, immutable authority epoch. Reusing the live driver would
-          // either retain stale authority or require rebinding old callbacks.
-          warmNativeSessions.delete(warmSessionId);
-          await entry.session.close({
-            reason: "warm native session authority epoch rotated",
-          });
-          persistedWarmSession = loadWarmNativeCheckpoint(
-            input.execution,
-            warmConfigDigest,
-          );
-        } else {
-          existingWarmSession = entry.session;
-        }
+        existingWarmSession = entry.session;
       }
     } else {
       persistedWarmSession = loadWarmNativeCheckpoint(
@@ -7186,15 +7176,25 @@ async function createRunnerdBackendWithinSessionClaim(
         },
       }
     : input.execution;
+  const effectiveRunnerEnvironmentBase: NodeJS.ProcessEnv = {
+    ...(input.runnerEnvironment ?? process.env),
+  };
+  // This authority bit is derived only from the selected execution target.
+  // Never let an agent, environment binding, or host variable disable the
+  // Codex sandbox for a local runner by supplying the same key.
+  delete effectiveRunnerEnvironmentBase.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX;
   const effectiveRunnerEnvironment: NodeJS.ProcessEnv = remoteRuntimeRoot
     ? {
-        ...(input.runnerEnvironment ?? process.env),
+        ...effectiveRunnerEnvironmentBase,
         HOME: remoteTarget!.remoteCwd,
         CODEX_HOME: posix.join(remoteTarget!.remoteCwd, ".codex"),
         PAPERCLIP_WORKSPACE_CWD: remoteTarget!.remoteCwd,
+        ...(remoteTarget!.transport === "sandbox"
+          ? { PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "1" }
+          : {}),
       }
     : {
-        ...(input.runnerEnvironment ?? process.env),
+        ...effectiveRunnerEnvironmentBase,
         PAPERCLIP_WORKSPACE_CWD: input.execution.workspace.cwd,
       };
   const archiveContinuityState = async () => {
@@ -7235,6 +7235,13 @@ async function createRunnerdBackendWithinSessionClaim(
     input.restartRecovery?.kind === "reattach_existing_runner"
       ? input.restartRecovery.process
       : null;
+  const executeCurrentToolAuthority = (
+    call: Parameters<SessionToolAuthorityEpoch["execute"]>[0],
+  ) => {
+    const current = sessionToolAuthorityEpochs.get(sessionScopeId);
+    if (!current) throw new Error("native_session_tool_authority_unavailable");
+    return current.execute(call);
+  };
   const backend = createNativeSessionBackend(runnerExecution, {
     runnerInstanceId: input.runnerInstanceId,
     environment: effectiveRunnerEnvironment,
@@ -7243,8 +7250,8 @@ async function createRunnerdBackendWithinSessionClaim(
       : "local_filesystem",
     onSpawn: input.onSpawn,
     dynamicTools,
-    dynamicToolHandler: (call) => authorityEpoch.execute(call),
-    acpxDynamicToolHandler: (call) => authorityEpoch.execute(call),
+    dynamicToolHandler: executeCurrentToolAuthority,
+    acpxDynamicToolHandler: executeCurrentToolAuthority,
     opencodeRuntimeDirectory: resolve(
       resolvePaperclipInstanceRoot(),
       "runtime",
@@ -7419,7 +7426,7 @@ async function createRunnerdBackendWithinSessionClaim(
           turnId: `turn-${input.execution.binding.runId}`,
           itemId: `item-${input.execution.binding.runId}`,
         },
-        controlPlaneRegistration: (authority) =>
+        controlPlaneRegistration: (authority, attachmentIdentity) =>
           measureNativeRunnerSpan(
             input.trace,
             "runner.transport.connect",
@@ -7446,7 +7453,9 @@ async function createRunnerdBackendWithinSessionClaim(
                   () =>
                     registerRunnerPrpAuthority({
                       companyId: input.execution.binding.companyId,
-                      runId: input.execution.binding.runId,
+                      runId:
+                        attachmentIdentity?.runId ??
+                        input.execution.binding.runId,
                       authority,
                     }),
                 );
@@ -7469,7 +7478,9 @@ async function createRunnerdBackendWithinSessionClaim(
                   () =>
                     resolvePaperclipRunnerTransport({
                       target,
-                      runId: input.execution.binding.runId,
+                      runId:
+                        attachmentIdentity?.runId ??
+                        input.execution.binding.runId,
                       localConnectUrl: "ws://127.0.0.1/unused",
                       runnerPublicUrl: input.runnerPublicUrl,
                       runnerCaBundlePath: input.runnerCaBundlePath,
@@ -7505,7 +7516,9 @@ async function createRunnerdBackendWithinSessionClaim(
                   () =>
                     resolvePaperclipRunnerTransport({
                       target,
-                      runId: input.execution.binding.runId,
+                      runId:
+                        attachmentIdentity?.runId ??
+                        input.execution.binding.runId,
                       localConnectUrl: "ws://127.0.0.1/unused",
                       runnerPublicUrl: input.runnerPublicUrl,
                       runnerCaBundlePath: input.runnerCaBundlePath,
@@ -7541,7 +7554,9 @@ async function createRunnerdBackendWithinSessionClaim(
                   () =>
                     registerRunnerPrpAuthority({
                       companyId: input.execution.binding.companyId,
-                      runId: input.execution.binding.runId,
+                      runId:
+                        attachmentIdentity?.runId ??
+                        input.execution.binding.runId,
                       authority,
                     }),
                   { parentName: "runner.transport.connect" },

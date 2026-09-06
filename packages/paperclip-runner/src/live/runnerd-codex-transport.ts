@@ -76,6 +76,8 @@ const MAX_NOTIFICATION_COUNT = 2_048;
 const MAX_NOTIFICATION_BYTES = 4 * 1024 * 1024;
 const RUNNER_CLIENT_VERSION = "0.3.0";
 const RUNNER_BOOTSTRAP_TICKET_TTL_MS = 60_000;
+const RUNNERD_MAX_OUTBOX_BYTES = 16 * 1024 * 1024;
+const RUNNERD_P0_RESERVE_BYTES = 1024 * 1024;
 
 function readLocalProcessStartedAt(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -400,7 +402,7 @@ async function rotateExternalAuthorityEpoch(
 }
 
 function rotatedRunAttachPayload(
-  state: Record<string, unknown>,
+  state: { commands?: unknown },
   desired: DurableRecoveryIdentity,
   authorizedTools: Record<string, unknown> | null,
   completionContract:
@@ -418,7 +420,22 @@ function rotatedRunAttachPayload(
     );
   if (!seed)
     throw new Error("native_runner_authority_rotation_seed_unavailable");
-  const payload = structuredClone(record(seed.payload));
+  return retargetRunAttachPayload(
+    record(seed.payload),
+    desired,
+    authorizedTools,
+    completionContract,
+  );
+}
+
+function retargetRunAttachPayload(
+  seedPayload: Record<string, unknown>,
+  desired: DurableRecoveryIdentity,
+  authorizedTools: Record<string, unknown> | null,
+  completionContract:
+    { revision: string; criterionIds: readonly string[] } | undefined,
+): Record<string, unknown> {
+  const payload = structuredClone(seedPayload);
   const provider = record(payload.provider);
   if (provider.kind === "acpx" || provider.provider === "acpx") {
     provider.runId = desired.runId;
@@ -958,7 +975,10 @@ export interface CapabilityRunnerdCodexTransportOptions {
     itemId: string;
   };
   /** Registers the run-bound PRP authority on Paperclip's shared HTTP server. */
-  controlPlaneRegistration?: (authority: DurablePrpControlPlane) => Promise<{
+  controlPlaneRegistration?: (
+    authority: DurablePrpControlPlane,
+    identity?: DurableRecoveryIdentity,
+  ) => Promise<{
     connectUrl?: string;
     connection?: RunnerProcessConnection;
     activate?: () => Promise<void> | void;
@@ -1923,7 +1943,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #handle: RunnerProcessHandle | null = null;
   #adoptedRunnerMonitor: NodeJS.Timeout | null = null;
   #pump: NodeJS.Timeout | null = null;
-  #eventIndex = 0;
+  #eventSourceSeq = 0;
+  #deferredTurnStartEvents: DurableRecoveryCommittedEvent[] = [];
   #threadId = "";
   #sessionId: string | null = null;
   #providerIdentity: Record<string, unknown> | null = null;
@@ -1942,6 +1963,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #expectedProviderTurnId: string | null = null;
   #durableTurnId = "";
   #authorizedTools: Record<string, unknown> | null = null;
+  #runAttachTemplate: Record<string, unknown> | null = null;
   #closed = false;
   #closePromise: Promise<void> | null = null;
   #failure: Error | null = null;
@@ -2214,6 +2236,95 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   setServerRequestHandler(handler: CodexServerRequestHandler): void {
     this.#handler = handler;
+  }
+
+  async attachRun(input: {
+    runId: string;
+    turnId: string;
+    itemId: string;
+  }): Promise<void> {
+    const core = this.#core;
+    if (!core || !this.#startupComplete) {
+      throw new Error("native_runner_prp_run_rotation_unavailable");
+    }
+    const prior = core.store.state.identity;
+    const desired: DurableRecoveryIdentity = {
+      ...prior,
+      runId: input.runId,
+      turnId: input.turnId,
+      itemId: input.itemId,
+    };
+    const registration = this.options.controlPlaneRegistration
+      ? await this.options.controlPlaneRegistration(core, desired)
+      : null;
+    const connection: RunnerProcessConnection =
+      registration?.connection ??
+      (registration?.connectUrl
+        ? { mode: "connect", connectUrl: registration.connectUrl }
+        : { mode: "connect", connectUrl: core.connectUrl });
+    const commandId = `command_attach_${createHash("sha256")
+      .update(`${prior.runId}:${desired.runId}:${desired.turnId}`)
+      .digest("hex")
+      .slice(0, 32)}`;
+    const runAttachTemplate = this.#runAttachTemplate
+      ? retargetRunAttachPayload(
+          this.#runAttachTemplate,
+          desired,
+          this.#authorizedTools,
+          this.options.resumeCompletionContract,
+        )
+      : rotatedRunAttachPayload(
+          core.store.state,
+          desired,
+          this.#authorizedTools,
+          this.options.resumeCompletionContract,
+        );
+    this.#runAttachTemplate = structuredClone(runAttachTemplate);
+    const payload = {
+      ...runAttachTemplate,
+      paperclipNextAuthority: { identity: desired, connection },
+    };
+    core.queueCommand("run.attach", payload, commandId, true);
+    await this.#waitCommand("run.attach", commandId);
+    const attached = core.store.state.commands.find(
+      (command) => command.commandId === commandId,
+    );
+    if (attached?.status !== "completed") {
+      await Promise.resolve(registration?.release()).catch(() => undefined);
+      throw new Error("native_runner_prp_run_rotation_failed");
+    }
+
+    const previousRelease = this.#controlPlaneRelease;
+    core.rotateRunIdentity(desired);
+    this.#eventSourceSeq = 0;
+    this.#deferredTurnStartEvents = [];
+    this.#durableTurnId = desired.turnId;
+    this.#controlPlaneRelease = registration?.release ?? null;
+    let previousReleased = false;
+    try {
+      await registration?.activate?.();
+      if (registration?.failure) {
+        void registration.failure.catch((error: unknown) => {
+          this.#failTransport(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        });
+      }
+      await previousRelease?.();
+      previousReleased = true;
+      await this.#awaitRegistrationReady(registration?.ready);
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.#controlPlaneRelease = null;
+      await Promise.allSettled([
+        Promise.resolve().then(() => registration?.release()),
+        ...(previousReleased
+          ? []
+          : [Promise.resolve().then(() => previousRelease?.())]),
+      ]);
+      this.#failTransport(failure);
+      throw failure;
+    }
   }
 
   async resolveRuntimeRequest(input: {
@@ -2985,8 +3096,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.options.runnerStateDirectory ?? resolve(this.#root, "runner"),
       identity,
       ticket: core.issueBootstrapTicket(RUNNER_BOOTSTRAP_TICKET_TTL_MS),
-      maxOutboxBytes: 256 * 1024,
-      p0ReserveBytes: 64 * 1024,
+      maxOutboxBytes: RUNNERD_MAX_OUTBOX_BYTES,
+      p0ReserveBytes: RUNNERD_P0_RESERVE_BYTES,
       maxRuntimeMs: 60 * 60 * 1_000,
       reconnectGraceMs: this.options.runnerReconnectGraceMs,
       lifecyclePolicy: this.options.lifecyclePolicy,
@@ -3298,15 +3409,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     });
     this.#core = core;
     if (rotatedAuthority) {
-      core.queueCommand(
-        "run.attach",
-        rotatedRunAttachPayload(
-          controlPlaneState,
-          desiredIdentity,
-          this.#authorizedTools,
-          this.options.resumeCompletionContract,
-        ),
+      const runAttachTemplate = rotatedRunAttachPayload(
+        controlPlaneState,
+        desiredIdentity,
+        this.#authorizedTools,
+        this.options.resumeCompletionContract,
       );
+      this.#runAttachTemplate = structuredClone(runAttachTemplate);
+      core.queueCommand("run.attach", runAttachTemplate);
     }
     const committedEvents = core.store.state.committedEvents;
     const runAttachment = recoveredRunAttachment(core.store.state);
@@ -3326,10 +3436,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     // If attachment completed, replay only its latest identity event into the
     // transport's in-memory evidence; session events are consumed internally
     // and are not duplicated onto the provider notification stream.
-    this.#eventIndex =
+    this.#eventSourceSeq =
       runAttachment !== null && runAttachment.providerIdentityEventIndex >= 0
-        ? runAttachment.providerIdentityEventIndex
-        : committedEvents.length;
+        ? committedEvents[runAttachment.providerIdentityEventIndex]!.sourceSeq -
+          1
+        : core.store.state.ackedSourceSeq;
     const adoptedProviderIdentityIndex =
       latestProviderIdentityEventIndex(committedEvents);
     if (
@@ -3388,8 +3499,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             this.options.runnerStateDirectory ?? resolve(this.#root, "runner"),
           identity,
           ticket: core.issueBootstrapTicket(RUNNER_BOOTSTRAP_TICKET_TTL_MS),
-          maxOutboxBytes: 256 * 1024,
-          p0ReserveBytes: 64 * 1024,
+          maxOutboxBytes: RUNNERD_MAX_OUTBOX_BYTES,
+          p0ReserveBytes: RUNNERD_P0_RESERVE_BYTES,
           maxRuntimeMs: 60 * 60 * 1_000,
           reconnectGraceMs: this.options.runnerReconnectGraceMs,
           lifecyclePolicy: this.options.lifecyclePolicy,
@@ -3675,8 +3786,21 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #pumpEvents(): void {
     this.#flushPendingTraceRehydrations();
     const events = this.#core?.store.state.committedEvents ?? [];
-    while (this.#eventIndex < events.length) {
-      const event = events[this.#eventIndex]!;
+    for (;;) {
+      const deferredEvent =
+        !this.#turnStartResponsePending || this.#expectedProviderTurnId !== null
+          ? this.#deferredTurnStartEvents[0]
+          : undefined;
+      const event =
+        deferredEvent ??
+        events.find((candidate) => candidate.sourceSeq > this.#eventSourceSeq);
+      if (event === undefined) return;
+      const fromDeferredQueue = deferredEvent !== undefined;
+      if (!fromDeferredQueue && event.sourceSeq !== this.#eventSourceSeq + 1) {
+        throw new Error(
+          `PRP provider event window advanced past source sequence ${this.#eventSourceSeq + 1}`,
+        );
+      }
       const eventPayload = record(event.envelope.payload).payload;
       const turnStartWhileCommandResultPending =
         this.#turnStartResponsePending &&
@@ -3687,9 +3811,25 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               (notification) => notification.method === "turn/started",
             )));
       // The durable command result is the only correlation authority for a
-      // provider-assigned turn id. Leave an early start at the cursor until
-      // that exact expected identity is installed.
-      if (turnStartWhileCommandResultPending) return;
+      // provider-assigned turn id. Copy an early start and its following
+      // events out of the control plane's sliding window until that exact
+      // expected identity is installed.
+      if (
+        !fromDeferredQueue &&
+        (turnStartWhileCommandResultPending ||
+          (this.#turnStartResponsePending &&
+            this.#expectedProviderTurnId === null &&
+            this.#deferredTurnStartEvents.length > 0))
+      ) {
+        if (this.#deferredTurnStartEvents.length >= 4_096) {
+          throw new Error(
+            "turn/start produced too many events before its durable command result",
+          );
+        }
+        this.#eventSourceSeq = event.sourceSeq;
+        this.#deferredTurnStartEvents.push(structuredClone(event));
+        continue;
+      }
       const terminalWhileTurnStartPending =
         this.#turnStartResponsePending &&
         ([
@@ -3702,8 +3842,18 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             unwrapRunnerdProviderNotifications(eventPayload).some(
               (notification) => notification.method === "turn/completed",
             )));
-      if (terminalWhileTurnStartPending) return;
-      this.#eventIndex += 1;
+      if (terminalWhileTurnStartPending) {
+        if (!fromDeferredQueue) {
+          this.#eventSourceSeq = event.sourceSeq;
+          this.#deferredTurnStartEvents.push(structuredClone(event));
+        }
+        return;
+      }
+      // The control plane retains a sliding committed-event window. Track its
+      // durable protocol cursor rather than an array index: once that array is
+      // full, new events replace its prefix without increasing its length.
+      if (fromDeferredQueue) this.#deferredTurnStartEvents.shift();
+      else this.#eventSourceSeq = event.sourceSeq;
       if (
         event.eventType === "harness.ready" ||
         event.eventType === "session.started" ||
@@ -4429,6 +4579,8 @@ export const runnerdLaunchProfileInternals = Object.freeze({
   acpxProviderPackageAuthority,
   acpxRunnerLaunchProfile,
   resolveBuildOwnedCliArtifact,
+  maxOutboxBytes: RUNNERD_MAX_OUTBOX_BYTES,
+  p0ReserveBytes: RUNNERD_P0_RESERVE_BYTES,
 });
 
 export const runnerdRecoveryInternals = Object.freeze({

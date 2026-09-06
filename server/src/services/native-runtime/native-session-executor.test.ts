@@ -2880,7 +2880,7 @@ describe("native warm session supervision", () => {
     );
   });
 
-  it("rehydrates a runnerd warm session from its checkpoint under a fresh run authority", async () => {
+  it("reattaches a live runnerd warm session under a fresh run authority", async () => {
     const stateBase = await mkdtemp(
       join(tmpdir(), "paperclip-runnerd-warm-authority-"),
     );
@@ -2889,9 +2889,7 @@ describe("native warm session supervision", () => {
     process.env.PAPERCLIP_RUNNER_STATE_DIR = stateBase;
     process.env.PAPERCLIP_HOME = stateBase;
     const firstClose = vi.fn(async () => undefined);
-    const secondClose = vi.fn(async () => undefined);
     const firstSession = { close: firstClose };
-    const secondSession = { close: secondClose };
     const first = {
       ...execution,
       binding: {
@@ -2947,18 +2945,8 @@ describe("native warm session supervision", () => {
         return result;
       })
       .mockImplementationOnce(async (options) => {
-        expect(options.existingSession).toBeUndefined();
-        expect(options.persistedSession).toEqual(
-          expect.objectContaining({
-            identity: expect.objectContaining({
-              runId: second.binding.runId,
-              sessionId: second.session.normalizedSessionId,
-            }),
-            providerSessionId: "provider-runnerd-warm",
-            activeTurnId: null,
-          }),
-        );
-        options.onSession?.(secondSession);
+        expect(options.existingSession).toBe(firstSession);
+        expect(options.persistedSession).toBeUndefined();
         return result;
       });
 
@@ -3014,10 +3002,10 @@ describe("native warm session supervision", () => {
         runnerInstanceId: "runner-runnerd-warm",
         useRunnerd: true,
       });
-      expect(firstClose).toHaveBeenCalledWith({
-        reason: "warm native session authority epoch rotated",
-      });
-      await vi.waitFor(() => expect(secondClose).toHaveBeenCalled(), {
+      expect(firstClose).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(firstClose).toHaveBeenCalledWith({
+        reason: "warm native session idle timeout",
+      }), {
         timeout: 500,
       });
     } finally {
@@ -3770,6 +3758,13 @@ describe("runnerd provider runtime wiring", () => {
       runnerExecutionTarget: remoteTarget,
     });
     state.createBackend.mock.calls[0]![1].codexTransportFactory!();
+    expect(state.createTransport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        environment: expect.objectContaining({
+          PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "1",
+        }),
+      }),
+    );
     const archiveExternalRunnerState =
       state.createTransport.mock.calls[0]![0].archiveExternalRunnerState;
     expect(archiveExternalRunnerState).toBeTypeOf("function");
@@ -3828,6 +3823,7 @@ describe("runnerd provider runtime wiring", () => {
       runnerEnvironment: {
         HOME: "/home/runner",
         PAPERCLIP_WORKSPACE_CWD: "/untrusted/configured-workspace",
+        PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "1",
       },
     });
 
@@ -3841,6 +3837,12 @@ describe("runnerd provider runtime wiring", () => {
         }),
       }),
     );
+    const localTransportOptions = state.createTransport.mock.calls[0]![0] as {
+      environment: NodeJS.ProcessEnv;
+    };
+    expect(
+      localTransportOptions.environment.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX,
+    ).toBeUndefined();
   });
 
   it("atomically migrates legacy unscoped state only for its exact durable run identity", async () => {
@@ -5392,9 +5394,13 @@ describe("runnerd provider runtime wiring", () => {
 
       const firstOptions = state.createBackend.mock.calls[0]![1];
       const continuationOptions = state.createBackend.mock.calls[1]![1];
-      await expect(firstOptions.dynamicToolHandler!({})).rejects.toThrow(
-        "native_tool_authority_epoch_revoked",
-      );
+      // The retained runner backend owns one stable callback. After run.attach,
+      // that callback routes through the session-scope authority registry to
+      // the new run; stale provider calls are rejected earlier by runnerd's
+      // turn identity boundary.
+      await expect(firstOptions.dynamicToolHandler!({})).resolves.toEqual({
+        runId: continuation.binding.runId,
+      });
       await expect(
         continuationOptions.dynamicToolHandler!({}),
       ).resolves.toEqual({ runId: continuation.binding.runId });
@@ -5546,6 +5552,12 @@ describe("runnerd provider runtime wiring", () => {
         }),
       }),
     );
+    const sshTransportOptions = state.createTransport.mock.calls[0]![0] as {
+      environment: NodeJS.ProcessEnv;
+    };
+    expect(
+      sshTransportOptions.environment.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX,
+    ).toBeUndefined();
     expect(state.createTransport.mock.calls[0]![0].runnerBinary).not.toBe(
       `${remoteCwd}/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd`,
     );
