@@ -5,6 +5,12 @@
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
 import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
+import { deliverExecutionStatuses } from "./services/execution-status-delivery.js";
+import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
+import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
+import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
+import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
+import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -894,6 +900,7 @@ async function startServerWithDatabaseTeardown(
     allowedHostnames: config.allowedHostnames,
     bindHost: config.host,
     authPublicBaseUrl: config.authPublicBaseUrl,
+    chatWebhookPublicBaseUrl: config.chatWebhookPublicBaseUrl,
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
     pluginMigrationDb: pluginMigrationDb as any,
@@ -1136,6 +1143,29 @@ async function startServerWithDatabaseTeardown(
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
     }
   };
+  const executionControlSweepsInFlight = new Set<string>();
+  const executionControlSweeps = [
+    ["finalization", () => reconcileAbandonedExecutionControl(db)],
+    ["replacement", () => heartbeat ? reconcileSafeNativeReplacements(db) : undefined],
+    ["reconciliation_delivery", () => heartbeat ? deliverReconciledExecutions(db, heartbeat.wakeup) : undefined],
+    ["status_delivery", () => deliverExecutionStatuses(db)],
+    ["automatic_disposition", () => settleUnrecoverableExecutions(db)],
+  ] as const;
+  const sweepExecutionControl = () => {
+    if (heartbeatSchedulerStopped) return;
+    // Independent durable queues must not block one another. Each queue remains
+    // single-flight; a later sweep observes committed transitions from its peers.
+    for (const [queue, work] of executionControlSweeps) {
+      if (executionControlSweepsInFlight.has(queue)) continue;
+      executionControlSweepsInFlight.add(queue);
+      trackHeartbeatSchedulerWork(Promise.resolve().then(async () => { await work(); })
+        .catch(err => logger.error({ err, queue }, "execution control reconciliation failed"))
+        .finally(() => { executionControlSweepsInFlight.delete(queue); }));
+    }
+  };
+  const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
+  executionControlInterval.unref?.();
+  sweepExecutionControl();
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
     heartbeatSchedulerInterval?.unref?.();
@@ -1182,6 +1212,7 @@ async function startServerWithDatabaseTeardown(
   const ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS = 5 * 60 * 1000;
   const environmentLeaseCleanupHeartbeat =
     heartbeat ?? heartbeatService(db as any, { pluginWorkerManager });
+  const connectionDeliveries = connectionIntentDeliveryService(db as any, environmentLeaseCleanupHeartbeat);
   const questionResponseDeliveries = questionResponseDeliveryService(db as any, {
     heartbeat: environmentLeaseCleanupHeartbeat,
     resolveNativeQuestion: (interaction) => deliverNativeQuestionResponse(db as any, interaction),
@@ -1236,6 +1267,9 @@ async function startServerWithDatabaseTeardown(
       }));
   };
 
+  await connectionDeliveries.sweepPending();
+  await app.locals.toolGateway.sweepActionReviews().catch((err: unknown) => logger.error({ err }, "startup tool review recovery failed"));
+  await app.locals.toolActionDeliveries.sweepPending().catch((err: unknown) => logger.error({ err }, "startup tool review delivery sweep failed"));
   await questionResponseDeliveries.sweepPending().then((result) => {
     if (result.scanned > 0) {
       logger.info(result, "startup question-response delivery sweep completed");
@@ -1457,6 +1491,23 @@ async function startServerWithDatabaseTeardown(
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
+        const recoveredGoalActions = await heartbeat.recoverPendingSessionGoalActions();
+        if (
+          recoveredGoalActions.enqueued > 0 ||
+          recoveredGoalActions.invalid > 0
+        ) {
+          logger.warn(
+            recoveredGoalActions,
+            "startup session-goal action outbox recovery reconciled pending controls",
+          );
+        }
+        const recoveredGoals = await heartbeat.recoverActiveSessionGoals();
+        if (recoveredGoals.enqueued > 0) {
+          logger.warn(
+            recoveredGoals,
+            "startup session-goal recovery resumed durable agent goals",
+          );
+        }
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
           promotion.promoted > 0 ||
@@ -1680,6 +1731,9 @@ async function startServerWithDatabaseTeardown(
             logger.error({ err }, "periodic secret proposal expiry sweep failed");
           }));
 
+        trackHeartbeatSchedulerWork(connectionDeliveries.sweepPending().catch((err) => logger.error({ err }, "connection continuation delivery failed")));
+        trackHeartbeatSchedulerWork(app.locals.toolGateway.sweepActionReviews().catch((err: unknown) => logger.error({ err }, "tool review recovery failed")));
+        trackHeartbeatSchedulerWork(app.locals.toolActionDeliveries.sweepPending().catch((err: unknown) => logger.error({ err }, "tool review delivery sweep failed")));
         trackHeartbeatSchedulerWork(questionResponseDeliveries.sweepPending()
           .then((result) => {
             if (result.scanned > 0) {
@@ -1859,6 +1913,7 @@ async function startServerWithDatabaseTeardown(
   ) => {
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
+    clearInterval(executionControlInterval);
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;
