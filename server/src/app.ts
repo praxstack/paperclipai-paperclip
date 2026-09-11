@@ -1,3 +1,5 @@
+import { emailChannelService } from "./services/email-channels.js";
+import { emailRoutes, emailWebhookRoutes } from "./routes/email.js";
 import { toolActionDeliveryService } from "./services/tool-action-delivery.js";
 import express, { Router, type Request as ExpressRequest } from "express";
 import {
@@ -34,6 +36,7 @@ import {
 import { companyTransferRunService } from "./services/company-transfer-runs.js";
 import { healthRoutes } from "./routes/health.js";
 import { cloudRuntimeIdentityMiddleware } from "./middleware/cloud-runtime-identity.js";
+import { cloudControlMiddleware } from "./middleware/cloud-control.js";
 import { cloudRoutes } from "./routes/cloud.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
@@ -112,6 +115,7 @@ import { adapterRoutes } from "./routes/adapters.js";
 import { managedAgentProfileRoutes } from "./routes/managed-agent-profiles.js";
 import { remoteAgentProfileRoutes } from "./routes/remote-agent-profiles.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
+import { injectCloudUiSnippet } from "./cloud-ui-snippet.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { staticUiCacheControl } from "./static-ui-cache.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -553,6 +557,10 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
+  // After the actor middleware on purpose: a valid Cloud control assertion
+  // REPLACES whatever actor the request otherwise resolved to, and only on
+  // the one endpoint it authorizes (see the middleware for the contract).
+  app.use(cloudControlMiddleware());
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
@@ -576,6 +584,8 @@ export async function createApp(
   // Provider-authenticated ingress is intentionally outside the board
   // mutation guard. The Chat SDK adapter verifies the provider signature
   // before Paperclip persists or acts on any event.
+  const emailChannels = emailChannelService(db, { heartbeat: connectionIntentHeartbeat, storage: opts.storageService, publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl });
+  app.use(emailWebhookRoutes(emailChannels));
   app.use(chatWebhookRoutes(chatChannels));
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
@@ -733,6 +743,7 @@ export async function createApp(
     }),
   );
   api.use(executionWorkspaceRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(emailRoutes(db, emailChannels));
   api.use(goalRoutes(db));
   api.use(onboardingSeedRoutes(db));
   api.use(boardChatRoutes(db, { deploymentMode: opts.deploymentMode }));
@@ -945,6 +956,10 @@ export async function createApp(
           immutable: true,
         }),
       );
+      // Serve root/index through the same runtime HTML transform as SPA routes.
+      app.get(["/", "/index.html"], (_req, res) => {
+        res.type("html").set("Cache-Control", "no-cache").send(readBrandedStaticIndexHtml(uiDist));
+      });
       // Non-hashed static files (favicon.ico, manifest, robots.txt, etc.):
       // short cache so operators who swap them out see the new version
       // reasonably fast, with must-revalidate overrides for index.html and
@@ -1053,7 +1068,7 @@ export async function createApp(
     viteHtmlRenderer = createCachedViteHtmlRenderer({
       vite,
       uiRoot,
-      brandHtml: applyUiBranding,
+      brandHtml: (html) => injectCloudUiSnippet(applyUiBranding(html)),
     });
     const renderViteHtml = viteHtmlRenderer;
 
@@ -1114,6 +1129,7 @@ export async function createApp(
   if (opts.feedbackExportService) {
     void flushPendingFeedbackExports();
   }
+  emailChannels.start();
   const flushChatPublications = async () => {
     await chatChannels.schedulePendingPublications();
   };
@@ -1285,6 +1301,7 @@ export async function createApp(
       viteHmrServer?.close();
       hostServiceCleanup.disposeAll();
       hostServiceCleanup.teardown();
+      await emailChannels.shutdown();
       await chatChannels.shutdown();
       // Cancel every live setup-token login session and AWAIT the cancellation,
       // so each direct child stops and the server releases each lease before the

@@ -1,3 +1,5 @@
+import { TaskChatPausedTakeover, type TaskComposerPause } from "./task-chat/TaskChatPausedTakeover";
+import { useEmailComment } from "./EmailMessageCard";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import type {
   ReasoningMessagePart,
@@ -517,6 +519,7 @@ interface IssueChatComposerProps {
   hasActiveRun?: boolean;
   currentUserId?: string | null;
   userLabelMap?: ReadonlyMap<string, string> | null;
+  composerPause?: TaskComposerPause | null;
   composerDisabledReason?: string | null;
   composerHint?: string | null;
   issueStatus?: string;
@@ -617,6 +620,7 @@ interface IssueChatThreadProps {
   currentAssigneeValue?: string;
   suggestedAssigneeValue?: string;
   mentions?: MentionOption[];
+  composerPause?: TaskComposerPause | null;
   composerDisabledReason?: string | null;
   composerHint?: string | null;
   onWorkModeChange?: (workMode: IssueWorkMode) => Promise<void> | void;
@@ -1258,12 +1262,7 @@ function IssueChatChainOfThought({
   let headerVerb: string;
   let headerSuffix: string | null = null;
   if (isActive) {
-    const execution = custom.execution as { phase?: string } | undefined;
-    headerVerb =
-      execution?.phase === "reconnecting" ||
-      execution?.phase === "retry_scheduled"
-        ? "Reconnecting…"
-        : "Working";
+    headerVerb = "Working";
     if (liveElapsed) headerSuffix = `for ${liveElapsed}`;
   } else if (segmentTiming) {
     const durationMs = segmentTiming.endMs - segmentTiming.startMs;
@@ -3490,7 +3489,12 @@ function CompactSystemNoticeRow({
   );
 }
 
-function SystemNoticeCommentRow({
+function SystemNoticeCommentRow(props: { message: ThreadMessage; anchorId?: string }) {
+  const custom = props.message.metadata.custom as Record<string, unknown>;
+  const email = useEmailComment(typeof custom.commentId === "string" ? custom.commentId : props.message.id);
+  return email ?? <SystemNoticeCommentContent {...props} />;
+}
+function SystemNoticeCommentContent({
   message,
   anchorId,
 }: {
@@ -4672,6 +4676,7 @@ const IssueChatComposer = forwardRef<
     hasActiveRun = false,
     currentUserId = null,
     userLabelMap = null,
+    composerPause = null,
     composerDisabledReason = null,
     composerHint = null,
     issueStatus,
@@ -4870,6 +4875,7 @@ const IssueChatComposer = forwardRef<
     Boolean(onStop || stopControl.stopping);
 
   async function handleSubmit() {
+    if (composerPause) return;
     const trimmed = body.trim();
     if (
       (!trimmed && attachedFiles.length === 0) ||
@@ -4893,6 +4899,7 @@ const IssueChatComposer = forwardRef<
   }
 
   async function submitComment() {
+    if (composerPause) return;
     const trimmed = body.trim();
     if (
       (!trimmed && attachedFiles.length === 0) ||
@@ -5234,6 +5241,10 @@ const IssueChatComposer = forwardRef<
       return current ? `${current} ${markdown}` : markdown;
     });
     setDismissedCoachToken(plainNameCandidate.matchedText);
+  }
+
+  if (composerPause) {
+    return <TaskChatPausedTakeover {...composerPause} hasDraft={Boolean(body.trim() || attachedFiles.length)} />;
   }
 
   if (composerDisabledReason) {
@@ -5752,6 +5763,7 @@ export function IssueChatThread({
   currentAssigneeValue = "",
   suggestedAssigneeValue,
   mentions = [],
+  composerPause = null,
   composerDisabledReason = null,
   composerHint = null,
   showComposer = true,
@@ -6440,8 +6452,8 @@ export function IssueChatThread({
       stoppingRunLabel,
       stopRunVariant,
       runFinalizationActions,
-      onInterruptQueued: stableOnInterruptQueued,
-      onCancelQueued: stableOnCancelQueued,
+      onInterruptQueued: composerPause ? undefined : stableOnInterruptQueued,
+      onCancelQueued: composerPause ? undefined : stableOnCancelQueued,
       onDeleteComment: stableOnDeleteComment,
       onImageClick: stableOnImageClick,
       onAcceptInteraction: stableOnAcceptInteraction,
@@ -6469,6 +6481,7 @@ export function IssueChatThread({
       stoppingRunLabel,
       stopRunVariant,
       runFinalizationActions,
+      composerPause,
       stableOnInterruptQueued,
       stableOnCancelQueued,
       stableOnDeleteComment,
@@ -6714,6 +6727,7 @@ export function IssueChatThread({
                 stopScope={stopScope}
                 currentUserId={currentUserId}
                 userLabelMap={userLabelMap}
+                composerPause={composerPause}
                 composerDisabledReason={composerDisabledReason}
                 composerHint={composerHint}
                 issueStatus={issueStatus}
