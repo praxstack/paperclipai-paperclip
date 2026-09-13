@@ -6,6 +6,10 @@ import {
 import { Router } from "express";
 import { z } from "zod";
 import {
+  createAiConnectionSchema,
+  aiConnectionLoginIntentSchema,
+  localAiConnectionSchema,
+  localAiLoginStartSchema,
   emailEndpointSetupSchema,
   emailConnectionSchema,
   emailSendSchema,
@@ -262,6 +266,9 @@ import {
   confirmChatIdentityLinkSchema,
   createChatEndpointSchema,
   createChatIdentityLinkIntentSchema,
+  inspectPhotonProjectSchema,
+  photonProjectIdSchema,
+  photonLineIdSchema,
   publishChatPublicationSchema,
   resolveChatActionSchema,
   resolveChatPublicationSchema,
@@ -787,6 +794,7 @@ const chatEndpointResponseSchema = z
     providerAccountId: z.string().nullable(),
     providerAccountLabel: z.string().nullable(),
     botExternalId: z.string().nullable(),
+    photonAllocation: z.enum(["dedicated", "shared"]).optional(),
     botUsername: z.string().nullable(),
     botLabel: z.string().nullable(),
     botAvatarUrl: z.string().nullable(),
@@ -820,6 +828,7 @@ const chatEndpointResourceResponseSchema = z
     availability: chatResourceAvailabilitySchema,
     enabled: z.boolean(),
     metadata: z.record(z.string(), z.unknown()),
+    participants: z.array(z.string()).optional(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
   })
@@ -1208,11 +1217,17 @@ function registerCurrentRoute(input: {
 }
 
 type OpenApiAuthLevel =
-  "public" | "runtime_tools" | "authenticated" | "board" | "instance_admin";
+  | "public"
+  | "agent_run"
+  | "runtime_tools"
+  | "authenticated"
+  | "board"
+  | "instance_admin";
 
 const BOARD_SESSION_AUTH_SCHEME = "BoardSessionAuth";
 const BOARD_API_KEY_AUTH_SCHEME = "BoardApiKeyAuth";
 const AGENT_BEARER_AUTH_SCHEME = "AgentBearerAuth";
+const AGENT_RUN_AUTH_SCHEME = "AgentRunAuth";
 const RUNTIME_TOOLS_BEARER_AUTH_SCHEME = "RuntimeToolsBearerAuth";
 
 function securityRequirement(name: string): Record<string, string[]> {
@@ -1271,6 +1286,16 @@ const BOARD_ONLY_PREFIXES = [
 ];
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "GET /api/companies/{companyId}/ai-connections",
+  "POST /api/companies/{companyId}/ai-connections",
+  "POST /api/companies/{companyId}/ai-connections/local",
+  "POST /api/companies/{companyId}/ai-connections/local/attempts",
+  "POST /api/companies/{companyId}/ai-connections/local/check",
+  "DELETE /api/companies/{companyId}/ai-connections/local/attempts/{sessionId}",
+  "PUT /api/companies/{companyId}/ai-connections/default",
+  "GET /api/companies/{companyId}/ai-connections/{connectionId}/active-runs",
+  "GET /api/companies/{companyId}/ai-connections/login/{sessionId}",
+
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
   "DELETE /api/issues/{id}/documents/{key}",
@@ -1442,6 +1467,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/chat-endpoints/{endpointId}/setup",
   "POST /api/chat-endpoints/{endpointId}/setup-secret",
   "POST /api/chat-endpoints/{endpointId}/test",
+  "POST /api/chat-endpoints/{endpointId}/photon/inspect",
   "GET /api/chat-endpoints/{endpointId}/resources",
   "PUT /api/chat-endpoints/{endpointId}/resources",
   "GET /api/chat-endpoints/{endpointId}/principals",
@@ -1559,6 +1585,7 @@ function resolveOperationAuthLevel(
 ): OpenApiAuthLevel {
   const key = operationKey(method, path);
   if (PUBLIC_OPERATIONS.has(key)) return "public";
+  if (key === "POST /api/mcp/project-tools") return "agent_run";
   if (RUNTIME_TOOLS_OPERATIONS.has(key)) return "runtime_tools";
   if (INSTANCE_ADMIN_OPERATIONS.has(key)) return "instance_admin";
   if (
@@ -1611,6 +1638,12 @@ function applyDocumentFixups(document: any): any {
       description:
         "Scoped token bound to an active heartbeat run and presented in the Authorization bearer header. The GitHub credential endpoint requires the distinct github_credentials scope.",
     },
+    [AGENT_RUN_AUTH_SCHEME]: {
+      type: "http",
+      scheme: "bearer",
+      bearerFormat: "Task-bound agent JWT",
+      description: "Paperclip-issued JWT bound to an active task run. Agent API keys, board sessions, and connection-only tokens are rejected.",
+    },
   };
   document.security = AUTHENTICATED_SECURITY;
 
@@ -1621,6 +1654,8 @@ function applyDocumentFixups(document: any): any {
       const authLevel = resolveOperationAuthLevel(method, path);
       if (authLevel === "public") {
         operation.security = [];
+      } else if (authLevel === "agent_run") {
+        operation.security = [securityRequirement(AGENT_RUN_AUTH_SCHEME)];
       } else if (authLevel === "runtime_tools") {
         operation.security = RUNTIME_TOOLS_SECURITY;
       } else if (authLevel === "authenticated") {
@@ -1634,6 +1669,8 @@ function applyDocumentFixups(document: any): any {
           ? { actor: "board", instanceAdmin: true }
           : authLevel === "board"
             ? { actor: "board" }
+            : authLevel === "agent_run"
+              ? { actor: "agent", heartbeatBound: true, taskBound: true }
             : authLevel === "runtime_tools"
               ? { actor: "runtime_tools", heartbeatBound: true }
               : authLevel === "authenticated"
@@ -2107,7 +2144,7 @@ registry.registerPath({
   tags: ["chat-channels"],
   summary: "Configure or change chat endpoint lifecycle state",
   description:
-    "Runs a setup or lifecycle action. `configure` and `reconnect` accept provider credentials (Slack: `botToken`, `signingSecret`; GitHub: `appId`, `privateKey` after Paperclip generates the webhook secret; Discord: `applicationId`, `guildId`, `botToken`; Microsoft Teams: `clientId`, `tenantId`, `clientSecret`; Telegram: `botToken`). Credentials are stored as Paperclip secret references and are never returned. Other actions do not require credentials.",
+    "Runs a setup or lifecycle action. `configure` and `reconnect` accept provider credentials (Slack: `botToken`, `signingSecret`; GitHub: `appId`, `privateKey` after Paperclip generates the webhook secret; Discord: `applicationId`, `guildId`, `botToken`; Microsoft Teams: `clientId`, `tenantId`, `clientSecret`; Telegram: `botToken`; iMessage Photon: `projectSecret`, with nonsecret `photon.projectId` and `photon.lineId` configuration). Credentials are stored as Paperclip secret references and are never returned. Other actions do not require credentials.",
   request: {
     params: z.object({ endpointId: z.string().uuid() }),
     body: jsonBody(configureChatEndpointSchema),
@@ -2120,6 +2157,9 @@ registry.registerPath({
     404: r.notFound,
     409: r.conflict,
     422: r.unprocessable,
+    429: { description: "Provider request limit reached; retry later" },
+    502: { description: "Provider returned an invalid response; inspect provider health" },
+    503: { description: "Provider temporarily unavailable; retry later" },
   },
 });
 
@@ -2143,11 +2183,46 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/chat-endpoints/{endpointId}/photon/inspect",
+  tags: ["chat-channels"],
+  summary: "Inspect Photon shared project or dedicated numbers for channel setup",
+  description:
+    "Requires a board user with connection-management access. The project secret is write-only input. Returns the project's actual allocation and eligibility for shared DMs or dedicated lines, never project secrets or minted line tokens. Responses are not cached. Inspection alone does not activate the channel.",
+  request: {
+    params: z.object({ endpointId: z.string().uuid() }),
+    body: jsonBody(inspectPhotonProjectSchema),
+  },
+  responses: {
+    200: r.ok(z.object({
+      projectId: photonProjectIdSchema,
+      projectName: z.string(),
+      allocation: z.enum(["dedicated", "shared"]),
+      eligible: z.boolean(),
+      lines: z.array(z.object({
+        lineId: photonLineIdSchema,
+        phoneNumber: z.string(),
+        eligible: z.boolean(),
+        unavailableReason: z.string().optional(),
+      }).strict()),
+    }).strict()),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    422: r.unprocessable,
+    429: { description: "Photon request limit reached; retry later" },
+    502: { description: "Photon returned an invalid response; inspect provider health" },
+    503: { description: "Photon temporarily unavailable; retry later" },
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/chat-endpoints/{endpointId}/test",
   tags: ["chat-channels"],
   summary: "Complete a chat endpoint setup test",
   description:
-    "Activates a verifying endpoint only after Paperclip has received a real provider event since the server-issued setup test boundary.",
+    "Activates a verifying endpoint only after Paperclip has received a real provider event since the server-issued setup test boundary. iMessage Photon additionally requires a fresh linked sender's task and a successful outbound agent publication.",
   request: { params: z.object({ endpointId: z.string().uuid() }) },
   responses: {
     200: r.ok(chatEndpointResponseSchema),
@@ -2164,7 +2239,7 @@ registry.registerPath({
   tags: ["chat-channels"],
   summary: "List destinations discovered for a chat endpoint",
   description:
-    "Lists provider destinations such as Slack and Discord channels, Teams channels, GitHub repositories, and Telegram chats. Direct-message resources are intentionally omitted.",
+    "Lists provider destinations such as Slack and Discord channels, Teams channels, GitHub repositories, Telegram chats, and iMessage Photon groups. Direct-message resources are intentionally omitted.",
   request: { params: z.object({ endpointId: z.string().uuid() }) },
   responses: {
     200: r.ok(z.array(chatEndpointResourceResponseSchema)),
@@ -9708,6 +9783,20 @@ for (const route of [
 
 registerCurrentRoute({
   method: "post",
+  path: "/api/mcp/project-tools",
+  tags: ["projects"],
+  summary: "Call project and task tools through the active task run's MCP transport",
+  body: z.object({
+    jsonrpc: z.literal("2.0"),
+    id: z.union([z.string(), z.number()]).nullable().optional(),
+    method: z.string(),
+    params: z.record(z.string(), z.unknown()).optional(),
+  }),
+  responses: { 200: r.ok(), 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
   path: "/runtime-tools/github/credentials",
   tags: ["connection-intents"],
   summary:
@@ -9798,6 +9887,51 @@ registerCurrentRoute({
   tags: ["connection-intents"],
   summary: "Decline an addressed connection request",
   body: declineConnectionIntentSchema,
+});
+
+// --- AI runtime connections -------------------------------------------------
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/ai-connections",
+  tags: ["ai-connections"],
+  summary: "List available AI connections and personal defaults",
+  query: z.object({ agentId: z.string().uuid().optional() }),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections",
+  tags: ["ai-connections"],
+  summary: "Validate and connect an AI API key, or reconnect its existing grant",
+  body: createAiConnectionSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "put",
+  path: "/api/companies/{companyId}/ai-connections/default",
+  tags: ["ai-connections"],
+  summary: "Set the signed-in owner’s personal AI default",
+  body: z.object({ grantId: z.string().uuid() }),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/ai-connections/{connectionId}/active-runs",
+  tags: ["ai-connections"],
+  summary: "List active runs attributed to an AI connection",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/ai-connections/login/{sessionId}",
+  tags: ["ai-connections"],
+  summary: "Get the connection saved by an owned completed login",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
 
 // --- Tool access -------------------------------------------------------------
@@ -10947,3 +11081,32 @@ export function openApiRoutes() {
   });
   return router;
 }
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/local",
+  tags: ["ai-connections"],
+  summary: "Verify and save the local operator's CLI subscription account",
+  body: localAiConnectionSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/local/attempts",
+  tags: ["ai-connections"], summary: "Prepare an isolated local subscription sign-in",
+  body: localAiLoginStartSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
+registerCurrentRoute({
+  method: "delete",
+  path: "/api/companies/{companyId}/ai-connections/local/attempts/{sessionId}",
+  tags: ["ai-connections"], summary: "Cancel an owned local subscription sign-in",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/local/check",
+  tags: ["ai-connections"], summary: "Check the local operator's subscription sign-in without saving a connection",
+  body: localAiConnectionSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});

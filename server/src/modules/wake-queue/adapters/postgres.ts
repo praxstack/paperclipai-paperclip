@@ -1,3 +1,6 @@
+import { isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
+import { instanceSettingsService } from "../../../services/instance-settings.js";
+import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -96,6 +99,9 @@ function toRunSnapshot(row: HeartbeatRunRow): RunSnapshot {
 
 function toIssueSnapshot(row: IssueRow): IssueSnapshot {
   return {
+    conversationAgentId: row.conversationAgentId,
+    conversationUserId: row.conversationUserId,
+    conversationState: row.conversationState,
     id: row.id,
     companyId: row.companyId,
     identifier: row.identifier ?? "",
@@ -263,7 +269,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const rows = await tx
         .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId })
         .from(issueComments)
-        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queuedCommentIds)));
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queuedCommentIds), currentConversationCommentCondition()));
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
       const liveNonSelfCommentIds = queuedCommentIds.filter((commentId) => {
         const row = rows.find((candidate) => candidate.id === commentId);
@@ -671,7 +677,7 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
     ["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) &&
     issue.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(issue.status);
-  if (!applies) return false;
+  if (!applies || isAcknowledgedNativeStop(run)) return false;
 
   const existing = await tx
     .select({ id: issueRecoveryActions.id })
@@ -889,6 +895,10 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
         .set({
           payload: input.mergedPayload,
           coalescedCount: input.nextCoalescedCount,
+          ...(input.manualUserWakeActorId ? {
+            requestedByActorType: "user",
+            requestedByActorId: input.manualUserWakeActorId,
+          } : {}),
           updatedAt: new Date(),
         })
         .where(
@@ -1033,7 +1043,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // queues a run.
           executionCancellationAcknowledged:
             run.status === "cancelled" &&
-            parseObject(run.resultJson?.executionCancellation).state === "acknowledged" &&
+            (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
             !interruptedQueue,
         };
         const preDrain = decidePreDrain(preDrainFacts);
@@ -1046,6 +1056,20 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         if (!issueRow) {
           throw new Error(`wake-queue: pre-drain decision ${preDrain.kind} reached without an issue row`);
         }
+
+        // Enqueue does not stamp executionRunId until dispatch. A concurrent
+        // queued successor still owns the next turn, including during a late
+        // finalization/stranded-queue retry under this issue lock. Another
+        // agent's review participation retains its separate recovery path.
+        const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, run.agentId),
+          sql`${heartbeatRuns.id} <> ${run.id}`,
+          or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
+          inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+        )).limit(1);
+        if (successor) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
 
         if (preDrain.kind === "blocked") {
           return {
@@ -1092,6 +1116,13 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           executionBlocker.cause === "execution_owner_active" && executionBlocker.runId === run.id &&
           runSnapshot.conversationContinuation && ["failed", "timed_out", "interrupted"].includes(run.status));
         if (executionBlocker && !recoveryOnly) {
+          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        }
+
+        // Releases still settle while Agent Chat is disabled, but no deferred
+        // turn or recovery successor may be created. Check here in the shared
+        // transaction so cleanup retries and restart sweeps use the same gate.
+        if (issueRow.conversationAgentId && !(await instanceSettingsService(tx).getExperimental()).enableAgentChat) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
