@@ -176,6 +176,7 @@ import { publishLiveEvent } from "./live-events.js";
 import {
   allocateHeartbeatRunEventSeq,
   appendHeartbeatRunEvent,
+  type AppendHeartbeatRunEventInput,
 } from "./heartbeat-run-events.js";
 import {
   queuedCommentIdsFromWakePayload,
@@ -296,6 +297,7 @@ import {
   emitAgentTaskRun,
   emitAgentTaskRunById,
 } from "./agent-task-run-telemetry.js";
+import { reportRunFailure } from "./run-failure-report.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
@@ -436,6 +438,7 @@ import {
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
 import {
+  applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
@@ -12597,6 +12600,7 @@ export function heartbeatService(
     if (previousStatus === updated.status) return;
     clearHeartbeatRunRuntimeStatus(updated.id);
     void emitAgentTaskRun(db, updated);
+    void reportRunFailure(db, updated);
   }
 
   async function setRunStatus(
@@ -13593,6 +13597,7 @@ export function heartbeatService(
       color?: string;
       message?: string;
       payload?: Record<string, unknown>;
+      retryExhaustion?: AppendHeartbeatRunEventInput["retryExhaustion"];
     },
   ) {
     const eventAt = new Date();
@@ -13631,7 +13636,9 @@ export function heartbeatService(
       color: event.color,
       message: sanitizedMessage,
       payload: sanitizedPayload,
+      retryExhaustion: event.retryExhaustion,
     });
+    if (persistedEvent.disposition === "duplicate") return;
     const seq = persistedEvent.row.seq;
 
     publishLiveEvent({
@@ -15149,16 +15156,18 @@ export function heartbeatService(
     const issueId = readNonEmptyString(contextSnapshot.issueId);
 
     if (!baseSchedule) {
+      const exhaustion = {
+        retryReason,
+        scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
+        maxAttempts,
+      };
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
         message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
-        payload: {
-          retryReason,
-          scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
-          maxAttempts,
-        },
+        payload: exhaustion,
+        retryExhaustion: exhaustion,
       });
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         await escalatePlanApprovalResumeFailureNeedsAttention({
@@ -16028,10 +16037,9 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  // Subscription homes are serialized so refresh tokens cannot be overwritten
-  // by another run. Contention is a resource wait, not broken authentication.
-  // The database lease is released on completion/disconnect; retrying remains
-  // safe across processes and each attempt revalidates the selected account.
+  // No code path raises the `ai_connection_busy` error any more. This
+  // function stays because a stored run row can still carry that error code
+  // from an earlier release.
   async function finalizeAiConnectionBusyDeferral(
     run: typeof heartbeatRuns.$inferSelect,
     error: HttpError,
@@ -20049,6 +20057,12 @@ export function heartbeatService(
         await instanceSettings.getExperimental();
       const isolatedWorkspacesEnabled =
         experimentalInstanceSettings.enableIsolatedWorkspaces;
+      // Inert on its own: the operator default only reaches the resolver when
+      // isolated workspaces are enabled at all, so a stack that has one flag
+      // without the other keeps its current behavior.
+      const defaultIsolatedWorkspacesEnabled =
+        isolatedWorkspacesEnabled &&
+        experimentalInstanceSettings.enableIsolatedWorkspacesByDefault;
       const parsedIssueExecutionWorkspaceSettings =
         parseIssueExecutionWorkspaceSettings(
           issueContext?.executionWorkspaceSettings,
@@ -20193,10 +20207,17 @@ export function heartbeatService(
           projectContext?.executionWorkspacePolicy,
         );
       const projectExecutionWorkspacePolicy =
-        gateProjectExecutionWorkspacePolicy(
-          parsedProjectExecutionWorkspacePolicy,
-          isolatedWorkspacesEnabled,
-        );
+        applyDefaultIsolatedExecutionWorkspacePolicy({
+          projectPolicy: gateProjectExecutionWorkspacePolicy(
+            parsedProjectExecutionWorkspacePolicy,
+            isolatedWorkspacesEnabled,
+          ),
+          defaultIsolatedWorkspacesEnabled,
+          // A resolved project row, not the issue's raw `projectId`: the
+          // substituted policy must only reach a task whose repository the
+          // worktree can actually be cut from.
+          hasProject: Boolean(projectContext),
+        });
       const retainedTrust = await resolveAndRetainRunTrustPreset(db, {
         companyId: agent.companyId,
         agentId: agent.id,
