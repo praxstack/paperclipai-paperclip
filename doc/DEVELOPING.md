@@ -1026,6 +1026,27 @@ OpenCode retains `allow`, `ask`, and `deny`; ACPX retains `approve-all`,
 otherwise stores the shared `gpt-5.6-sol` default. The native execution boundary
 applies the same default to older runner rows whose model is missing or blank.
 
+For an Agent Chat test drive, enable **Agent Chat** in Experimental settings and
+configure two agents with Paperclip Runner: native Codex and ACPX Claude. Connect
+the Claude account through the agent's **AI connection** section (or supply an
+explicit supported provider credential); an ambient Claude CLI login alone is
+not a credential source for its isolated runner home. The conservative ACPX
+permission mode fails closed when no coordinator decision is available, including
+for MCP tools. Use `approve-all` only for agents authorized to perform the test's
+tool actions; the server still enforces company and action permissions.
+
+Test questions, saved plan revisions, approval before task handoff, status
+lookups, and `/new` preserving chat history. Hiring additionally requires the
+operator-controlled [runner API tools](runner-api-tools.md) rollout; enabling
+Agent Chat does not enable that API surface. Failed-turn retries restore the
+selected run's user comments so the agent can answer the original request.
+
+A native continuation that requires reconciliation shows **Recovery needed**
+with **Inspect run**; inspect the original outcome before resolving its recovery
+hold. A generic retry cannot resolve this incident. The runner's
+`get_task_context` includes up to 100 existing direct child tasks and a truncation
+flag so resumed agents can reuse delegated work and inspect completed results.
+
 For native Codex runs, Paperclip passes the resolved execution workspace as
 `PAPERCLIP_WORKSPACE_CWD` and uses it as the provider containment boundary. A
 workspace below the host `HOME` is valid, including the default projectless
@@ -1501,6 +1522,12 @@ Networking behavior for this smoke script:
 
 See [execution GitHub identity](execution-github-identity.md) for the operation-time credential contract, continuation rules, runtime rollout, and acceptance-test requirements.
 
+### Agent persona Storybook
+
+See [agent-personas.md](agent-personas.md) for the dynamic avatar endpoint, cache,
+and character stories. Set `PAPERCLIP_STORYBOOK_API_URL` to your isolated
+Paperclip API URL when running dev Storybook. Published Storybook builds automatically
+package avatar PNGs using the API renderer; static hosting needs no API proxy.
 
 ### Investigating polling load
 

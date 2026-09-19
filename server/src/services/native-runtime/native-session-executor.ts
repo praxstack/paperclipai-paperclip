@@ -153,6 +153,7 @@ import {
   type NativeRunTrace,
 } from "./native-run-trace.js";
 import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
+import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
 import { readProcessStartedAt } from "../hot-restart.js";
@@ -996,7 +997,8 @@ export function createGovernedWaitEventObservation(
     async observe(event: PrpEvent, eligible: boolean): Promise<void> {
       const currentGeneration = ++generation;
       observation = null;
-      const kind = record(event.payload).kind;
+      const payload = record(event.payload);
+      const kind = payload.kind;
       const tool = ["dynamicToolCall", "mcpToolCall", "commandExecution"].includes(String(kind));
       if (event.itemId) {
         if (tool && event.eventType === "item.started") pendingTools.add(event.itemId);
@@ -1009,7 +1011,7 @@ export function createGovernedWaitEventObservation(
       // still awaiting its response. Parking then interrupts that in-flight
       // response and cannot produce a durable suspension checkpoint.
       if (event.eventType === "item.completed" && (
-        pendingTools.size > 0 || (!tool && kind !== "agentMessage")
+        pendingTools.size > 0 || (!tool && !(kind === "agentMessage" && payload.channel === "final"))
       )) return;
       if (!eligible) return;
       const result = await resolvePending();
@@ -9059,6 +9061,17 @@ export function assertRemoteRunnerBuildMetadata(
   ) {
     throw new Error("runner_remote_artifact_contract_incompatible");
   }
+  // Older sandbox images share binary contract v2, but reject the zero
+  // lifetime now used by the controller and cannot renew connection leases.
+  // Reject them before launch so preparation stages the bundled runner instead.
+  const sessionCapabilities = Array.isArray(metadata.durableSessionCapabilities)
+    ? metadata.durableSessionCapabilities
+    : [];
+  for (const capability of ["unlimited_runtime", "connection_lease_renewal"]) {
+    if (!sessionCapabilities.includes(capability)) {
+      throw new Error(`runner_remote_session_capability_missing:${capability}`);
+    }
+  }
   const modes = Array.isArray(metadata.prpTransportModes)
     ? metadata.prpTransportModes
     : [];
@@ -11358,7 +11371,7 @@ async function createRunnerdBackendWithinSessionClaim(
 
                 const currentRoot = resolve(backupRoot, "current");
                 const previousRoot = resolve(backupRoot, "previous");
-                rmSync(previousRoot, { recursive: true, force: true });
+                removeNativeHarnessBackup(previousRoot);
                 let movedCurrent = false;
                 if (existsSync(currentRoot)) {
                   renameSync(currentRoot, previousRoot);
@@ -11378,7 +11391,7 @@ async function createRunnerdBackendWithinSessionClaim(
                   }
                 } catch (error) {
                   if (existsSync(currentRoot)) {
-                    rmSync(currentRoot, { recursive: true, force: true });
+                    removeNativeHarnessBackup(currentRoot);
                   }
                   if (
                     movedCurrent &&
@@ -11389,9 +11402,9 @@ async function createRunnerdBackendWithinSessionClaim(
                   }
                   throw error;
                 }
-                rmSync(previousRoot, { recursive: true, force: true });
+                removeNativeHarnessBackup(previousRoot);
               } finally {
-                rmSync(pendingRoot, { recursive: true, force: true });
+                removeNativeHarnessBackup(pendingRoot);
               }
             },
             {
