@@ -1,3 +1,4 @@
+import { createLocalNativeQuestionBridge } from "./local-native-question-bridge.js";
 import { readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
 import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
@@ -113,6 +114,7 @@ import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { nativeSha256 } from "./canonical.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
+import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 import { NativeChatAttachmentReadScope } from "./chat-attachment-read.js";
 import {
   assertCurrentWakeCommentsRead,
@@ -981,6 +983,7 @@ export function nativeConversationReplyResult(input: {
 export function createGovernedWaitEventObservation(
   resolvePending: () => Promise<PrpStructuredRunResult | null>,
 ) {
+  const pendingTools = new Set<string>();
   let generation = 0;
   let observation: {
     sourceInstanceId: string;
@@ -993,6 +996,21 @@ export function createGovernedWaitEventObservation(
     async observe(event: PrpEvent, eligible: boolean): Promise<void> {
       const currentGeneration = ++generation;
       observation = null;
+      const kind = record(event.payload).kind;
+      const tool = ["dynamicToolCall", "mcpToolCall", "commandExecution"].includes(String(kind));
+      if (event.itemId) {
+        if (tool && event.eventType === "item.started") pendingTools.add(event.itemId);
+        // Terminal error events can omit kind; the tracked ID owns cleanup.
+        if (event.eventType === "item.completed" || event.eventType === "item.failed") {
+          pendingTools.delete(event.itemId);
+        }
+      }
+      // Usage/model messages can arrive while the tool creating the card is
+      // still awaiting its response. Parking then interrupts that in-flight
+      // response and cannot produce a durable suspension checkpoint.
+      if (event.eventType === "item.completed" && (
+        pendingTools.size > 0 || (!tool && kind !== "agentMessage")
+      )) return;
       if (!eligible) return;
       const result = await resolvePending();
       if (generation !== currentGeneration || result === null) return;
@@ -7383,6 +7401,11 @@ async function executePaperclipNativeSessionWithinScope(
         payload: event.payload,
       },
     );
+  const liveQuestions = createLocalNativeQuestionBridge({
+    db: input.db,
+    binding: { ...input.execution.binding, normalizedSessionId: nativeSessionKey(input.execution), runnerSourceInstanceId: effectiveRunnerInstanceId },
+    resolve: resolveNativeRuntimeRequest,
+  });
   let completedConversationReply: PrpEvent | null = null;
   const controlPlane = new PaperclipControlPlanePort(
     input.db,
@@ -7404,6 +7427,7 @@ async function executePaperclipNativeSessionWithinScope(
             record(event.payload).channel === "final") {
           completedConversationReply = event;
         }
+        await liveQuestions.observe(event);
         await projectSessionGoalEvent(event);
         providerUsageLimitObserved ||= nativeProviderUsageLimitFromEvent(event);
         const eventAtMs = Date.parse(event.emittedAt);
@@ -7620,6 +7644,7 @@ async function executePaperclipNativeSessionWithinScope(
         // A crash can happen after the event commit but before its callback
         // finishes. Recover only idempotent durable projections here; activity,
         // publication, logging, trace, and metric effects remain committed-only.
+        await liveQuestions.observe(event);
         await projectSessionGoalEvent(event);
         providerUsageLimitObserved ||= nativeProviderUsageLimitFromEvent(event);
         const questionFallback = await materializeRuntimeQuestionFallback({
@@ -7762,6 +7787,9 @@ async function executePaperclipNativeSessionWithinScope(
               : []),
           ),
           eq(issueThreadInteractions.status, "pending"),
+          // Live provider questions resume their current turn; only durable
+          // wake-based cards park it. A timeout creates a separate fallback.
+          sql`not (${issueThreadInteractions.kind} = 'ask_user_questions' and ${issueThreadInteractions.continuationPolicy} = 'none' and coalesce(${issueThreadInteractions.idempotencyKey}, '') like 'paperclip-runner-question:%')`,
         ),
       )
       .orderBy(
@@ -7990,6 +8018,7 @@ async function executePaperclipNativeSessionWithinScope(
             },
             onSession: async (session) => {
               releaseRegisteredGoalController();
+              liveQuestions.close();
               if (session?.goal) {
                 releaseGoalController = registerLiveRunnerGoalController(
                   {
@@ -8054,10 +8083,12 @@ async function executePaperclipNativeSessionWithinScope(
                   session,
                   cancelRequested: false,
                 });
+                if (session.resolveRuntimeRequest) await liveQuestions.attach();
                 if (nativeRunsDetachingForRestart.has(input.execution.binding.runId)) {
                   await session.detachControllerForRestart?.();
                 }
               } else {
+                liveQuestions.close();
                 activeNativeSessions.delete(input.execution.binding.runId);
                 clearSteeringDeliveries(input.execution.binding.runId);
                 clearNativeRuntimeRequestResolutions(
@@ -8093,12 +8124,14 @@ async function executePaperclipNativeSessionWithinScope(
       startedAtMs: turnCompletedAtMs ?? nativeSessionExecuteStartedAtMs,
       endedAtMs: Date.now(),
     });
+    liveQuestions.close();
     activeNativeSessions.delete(input.execution.binding.runId);
     clearSteeringDeliveries(input.execution.binding.runId);
     clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
   } catch (error) {
     if (nativeRunsDetachingForRestart.has(input.execution.binding.runId)) {
       await leaseRenewal.stop().catch(() => undefined);
+      liveQuestions.close();
       activeNativeSessions.delete(input.execution.binding.runId);
       // Disconnecting deliberately ends the old event consumer. It is not a
       // provider failure and must not overwrite the shutdown adoption record
@@ -8144,6 +8177,7 @@ async function executePaperclipNativeSessionWithinScope(
         });
       }
       trace.activate(taskSettleScope);
+      liveQuestions.close();
       activeNativeSessions.delete(input.execution.binding.runId);
       clearSteeringDeliveries(input.execution.binding.runId);
       clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
@@ -9972,7 +10006,17 @@ async function createRunnerdBackendWithinSessionClaim(
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
   const connectorAssignments = [...pinnedSkills].some(isConnectorSkill)
     ? await resolveConnectorAssignments(input.db, input.execution.binding) : [];
+  const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+    .from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, input.execution.binding.runId),
+      eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+    )).limit(1).then((rows) => rows[0]);
+  const nativeReview = readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);
+  if (nativeReview && !await getNativeReviewAssignment(input.db, {
+    ...input.execution.binding, contextSnapshot: nativeReview,
+  })) throw new Error("native_review_assignment_no_longer_available");
   const authority = new PaperclipRunnerToolAuthority(input.db, {
+    ...(nativeReview ? { nativeReview } : {}),
     connectorAssignments: connectorAssignments.filter((assignment) => pinnedSkills.has(assignment.skillKey)),
     companyId: input.execution.binding.companyId,
     issueId: input.execution.binding.issueId,
