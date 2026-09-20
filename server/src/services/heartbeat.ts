@@ -1,14 +1,15 @@
+import { publicChatTaskUrl } from "./chat-task-url.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
-import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
+import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { connectionIntentService } from "./connection-intents.js";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
+import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
@@ -3649,6 +3650,7 @@ interface WakeupOptions {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    statusVersion?: number;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -6462,6 +6464,7 @@ function buildSessionConfigCategoryValues(input: {
 export async function buildEffectiveRunSessionConfigMetadata(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
+  managedAiHome?: string;
   agentRuntimeConfig: unknown;
   issueOverrides: unknown;
   workspaceConfig: unknown;
@@ -6479,7 +6482,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   );
   const categoryValues = buildSessionConfigCategoryValues({
     adapterType: input.adapterType,
-    effectiveAdapterConfig: input.effectiveAdapterConfig,
+    effectiveAdapterConfig: managedAiSessionFingerprintConfig(input.effectiveAdapterConfig, input.managedAiHome),
     agentRuntimeConfig: input.agentRuntimeConfig,
     instructions,
     issueOverrides: input.issueOverrides,
@@ -8582,6 +8585,21 @@ export function buildPaperclipTaskMarkdown(input: {
     (count, comment) => count + (comment.attachments?.length ?? 0),
     0,
   );
+  if (input.externalChatProvider && issue) {
+    const taskUrl = publicChatTaskUrl(issue.id);
+    lines.push(
+      "",
+      "Paperclip task link (server-provided):",
+      ...(taskUrl
+        ? [
+            `- Public task URL: ${taskUrl}`,
+            "When asked for this task's link, use this exact URL. Do not construct a URL from task IDs, localhost, an API address, or a sandbox address. Opening it still requires Paperclip access.",
+          ]
+        : [
+            "No public task URL is configured. If asked for a link, explain that a public Paperclip URL must be configured; do not invent a URL or expose an internal API or sandbox address.",
+          ]),
+    );
+  }
   if (input.externalChatProvider && input.nativeRunner) {
     lines.push(
       "",
@@ -12848,7 +12866,7 @@ export function heartbeatService(
 
     // Teardown can beat the cancellation finalizer. Preserve the acknowledged
     // user intent instead of reporting an infrastructure interruption.
-    if (hasAcknowledgedNativeStopIntent(run)) terminalStatus = "cancelled";
+    if (hasAcknowledgedNativeStopIntent(run) || hasAcknowledgedNativeReassignmentStopIntent(run)) terminalStatus = "cancelled";
 
     const message = `run terminalized on environment lease release: heartbeat_runs.status was still ${run.status} at teardown`;
     // Match both "running" and "queued". A queued run has released its lease but
@@ -14839,6 +14857,7 @@ export function heartbeatService(
     const claims = dispositions.filter(
       (disposition): disposition is NativeRestartRecoveryClaim =>
         disposition.kind === "reattach_existing_runner" ||
+        disposition.kind === "reattach_remote_runner" ||
         disposition.kind === "resume_dead_runner" ||
         disposition.kind === "bootstrap_incomplete",
     );
@@ -14847,6 +14866,7 @@ export function heartbeatService(
       if (run) {
         const isClaim =
           disposition.kind === "reattach_existing_runner" ||
+          disposition.kind === "reattach_remote_runner" ||
           disposition.kind === "resume_dead_runner" ||
           disposition.kind === "bootstrap_incomplete";
         await appendRunEvent(run, {
@@ -14854,7 +14874,8 @@ export function heartbeatService(
           stream: "system",
           level: disposition.kind === "blocked" ? "warn" : "info",
           message:
-            disposition.kind === "reattach_existing_runner"
+            disposition.kind === "reattach_existing_runner" ||
+            disposition.kind === "reattach_remote_runner"
               ? "Recovering the existing native runner process after server restart"
               : disposition.kind === "resume_dead_runner"
                 ? "Resuming the durable native provider session after runner process loss"
@@ -17129,6 +17150,23 @@ export function heartbeatService(
     }
 
     const issueId = readNonEmptyString(context.issueId);
+    if (issueId && activeRunExecutions.size > 0) {
+      // Native finalization publishes success before workspace synchronization,
+      // provider suspension, and lease release finish. A queued comment must
+      // not acquire a fresh sandbox while its predecessor still owns that work.
+      // The executor's finally block retries this agent after removing its owner.
+      const [settlingOwner] = await db.select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.runtimeMode, "native"),
+          inArray(heartbeatRuns.id, [...activeRunExecutions]),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        ))
+        .limit(1);
+      if (settlingOwner) return null;
+    }
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         run.companyId,
@@ -19903,7 +19941,8 @@ export function heartbeatService(
     if (
       runOptions.nativeLeaseOwner &&
       run.runtimeMode === "native" &&
-      runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner"
+      runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner" &&
+      runOptions.nativeRestartRecovery?.kind !== "reattach_remote_runner"
     ) {
       // A numeric PID or process-group ID is a liveness signal, never an
       // ownership capability: the OS may have recycled it after the service
@@ -21211,6 +21250,7 @@ export function heartbeatService(
         await buildEffectiveRunSessionConfigMetadata({
           adapterType: agent.adapterType,
           effectiveAdapterConfig: runtimeConfig,
+          managedAiHome: managedAiRuntime?.home,
           agentRuntimeConfig: agent.runtimeConfig,
           issueOverrides: issueAssigneeOverrides,
           workspaceConfig: {
@@ -24072,6 +24112,21 @@ export function heartbeatService(
                       runnerRemoteProviderPackPath:
                         runtimeEnv.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH?.trim() ||
                         null,
+                      stopTaskForReassignment: async (target) => {
+                        await settleLiveRunnerGoalBeforeInterrupt(db, target);
+                        if (!target.runId) return;
+                        const prior = await getRun(target.runId);
+                        if (!prior || prior.companyId !== target.companyId || prior.agentId !== target.agentId) {
+                          throw conflict("Reassignment run binding changed");
+                        }
+                        const stopped = await cancelRunInternal(target.runId, "Cancelled for task reassignment", {
+                          errorCode: "issue_reassigned", suppressImmediateRecovery: true,
+                          resultJson: { reassignmentStopConfirmed: true },
+                        });
+                        if (stopped && ["running", "queued", "scheduled_retry"].includes(stopped.status)) {
+                          throw conflict("The previous run did not stop; reassignment was not applied");
+                        }
+                      },
                       enqueueWakeup,
                       onSpawn: async (meta) => {
                         markDispatchStarted();
@@ -26717,6 +26772,7 @@ export function heartbeatService(
               conversationUserId: issues.conversationUserId,
               conversationState: issues.conversationState,
               status: issues.status,
+              statusVersion: issues.statusVersion,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -26942,7 +26998,8 @@ export function heartbeatService(
           if (
             issueStateGuard &&
             (!issueStateGuard.statuses.includes(issue.status) ||
-              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId)
+              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
+              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion))
           ) {
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
@@ -28597,7 +28654,11 @@ export function heartbeatService(
     // additional durable fence before its existing cancellation path.
     if (run.runtimeMode === "native" || (!run.runtimeModeResolvedAt && !running && !control)) {
       const [fenced] = await db.update(heartbeatRuns).set({
+        // Record handoff intent before native cancellation can finalize and release
+        // the run. Only its audited stop acknowledgement suppresses recovery.
         resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+          ${JSON.stringify(options.errorCode === "issue_reassigned" && options.resultJson?.reassignmentStopConfirmed === true
+            ? { reassignmentStopRequested: true } : {})}::jsonb ||
           jsonb_build_object('startupCancellation', jsonb_build_object(
             'requestedAt', ${new Date().toISOString()}::text,
             'beforeNativeSelection', ${heartbeatRuns.runtimeMode} = 'legacy'
