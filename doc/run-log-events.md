@@ -16,15 +16,38 @@ a system warning in the task conversation. It remains local run-log data.
 The hidden native coordinator writes each validated PRP event to the bound
 run's existing event stream before it acknowledges the runner. The row keeps
 the PRP `eventType`, source instance, source event ID, source sequence, protocol
-schema version, and a SHA-256 digest of the canonical source envelope. Its
+schema version, and a SHA-256 digest of the canonical stored envelope. Its
 payload is `{ "prpEvent": <canonical PRP event> }`.
+
+Native API tool events omit HTTP request and response bodies from durable history.
+This includes serialized provider `contentItems`, legacy HTTP receipts and
+`call_api` arguments. Saved receipts retain the operation and call IDs, success
+flag, HTTP status and content type when present. The body becomes
+`***REDACTED***`, with `apiPayloadRedacted: true` and `apiPayloadSha256`, a SHA-256
+digest of the original payload. These digests distinguish duplicate events from
+changed payloads; they cannot recover omitted bodies for debugging or replay.
+The model receives the original authorized response. Credential-bearing mutation
+receipts use encrypted storage separately from this run log.
+
+Checkpoints and completion records apply the same redaction. Completion retries
+compare stored and expected payloads through the control-plane port's idempotent
+`normalizeReplayPayload` projection, so a saved redacted result can be confirmed
+without restoring API bodies. Ports without a projection compare their original
+payloads. Repeated redaction preserves the original digest and detects changed
+private payloads.
+
+The native runtime passes this projection through backend recovery to the Codex
+driver. Recovery compares saved semantic results and turn fingerprints with
+provider history through the same representation. A private body change retains
+its distinct digest and fails recovery; an unchanged body does not require
+restoring its plaintext into the checkpoint.
 
 PostgreSQL JSONB cannot represent NUL (U+0000), which can occur in command
 output such as Vite virtual-module paths. The run-event payload column uses a
 lossless storage codec for these events: the JSONB projection renders NUL as
 the literal `\u0000`, and the reserved `$paperclipRunEventJsonV1` field contains
 the original serialized JSON as a doubly escaped string. Ordinary payloads
-retain their existing representation. Drizzle reads restore the exact original
+retain their existing representation. Drizzle reads restore the exact stored
 payload before replay, hash validation, redaction, or API presentation. SQL
 queries can still inspect ordinary routing fields in the projection; raw SQL
 readers of the whole payload must apply `decodeRunEventPayload`. The column
@@ -115,6 +138,11 @@ The event never includes bootstrap tickets, reconnect leases, authentication
 proofs, encryption keys, environment variables, provider credentials, command
 arguments, or an unsanitized stderr stream. Detailed failed-attempt diagnostics
 remain in the bounded `native_run_finalizations.recovery_history` ledger.
+
+For a prepared remote workspace interrupted before its first executor claim,
+that ledger records `remote_execution_never_claimed` with a
+`bootstrap_incomplete` disposition. The provider attempt remains zero during
+classification; the executor increments it before starting provider work.
 
 For a local Codex turn lost while runnerd was stopped, the canonical `turn.failed`
 event retains `error.code: "provider_turn_lost_on_restore"` and
@@ -297,11 +325,29 @@ section in the Observability contract.
 
 Cancelled runs retain `resultJson.cancellation`: a closed `source` label
 (`operator`, `queued_message`, `shutdown`, `provider`, `transport`,
-`control_plane`, or `unknown`), whether the stop was expected, the initiator,
-reason, and recording time. Recorded stop intent survives adapter completion.
+`control_plane`, `controller_lease`, or `unknown`), whether the stop was expected,
+the initiator, reason, and recording time. Recorded stop intent survives adapter
+completion. `controller_lease` means the host stopped its own legacy adapter
+after it lost the durable controller lease; the reason names a closed cause
+(`renewal_rejected`, `renewal_deadline`, or `renewal_error`).
+A lease lost during run setup (for example a rejected renewal while preparing
+the workspace) settles the run `failed` with error code `controller_lease_lost`,
+the same `controller_lease` cancellation evidence, and
+`executionRecovery.providerWorkStarted: false`. Recovery retries it as transient
+infrastructure instead of blocking on `setup_failed`. A setup-phase error after
+provider dispatch began keeps `setup_failed`, so started work is never retried.
 The local lifecycle event includes this evidence. Started cancellations without
 an expected stop are also reported to Sentry; its cancellation diagnostics contain
-only source, expectedness, and initiator type, never initiator IDs or reason text.
+only source, expectedness, initiator type, and the closed lease-loss cause, never
+initiator IDs or reason text.
+A lease loss also records `resultJson.controllerLeaseLoss`, including a loss
+during setup that fails the run before adapter dispatch. It holds the closed
+cause and the watchdog timings in milliseconds: `sinceRenewalMs` (since the
+last successful renewal), `renewalPendingMs` (age of a renewal query still in
+flight, or `null`), `deadlineLateMs` (how late the deadline callback ran, for
+`renewal_deadline` only), and `renewalCount`. A long `renewalPendingMs` points
+at a stalled database query; a long `deadlineLateMs` points at a blocked event
+loop. Failure reports carry these bounded numbers and the cause label only.
 Historical ambiguous cancellations stay `unknown` and do not authorize replay.
 
 Provider tool-definition validation failures use
