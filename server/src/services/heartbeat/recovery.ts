@@ -1,3 +1,4 @@
+import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { preserveCancelledNativeWorkspaces } from "../native-runtime/native-failed-workspace-recovery.js";
@@ -8,6 +9,7 @@ import {
   settleStopOnlyCleanup,
 } from "../sandbox-stop-and-retain.js";
 import { recordNativeLocalProcessStop } from "../native-local-process-stop.js";
+import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import {
   legacyControllerBootId,
   hasLiveLegacyController,
@@ -98,6 +100,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
     Awaited<ReturnType<ReturnType<typeof createHeartbeatRunState>["getRun"]>> | null
   >;
   environmentRuntime: ReturnType<typeof environmentRuntimeService>;
+  pluginWorkerManager?: WorkspaceWorkers;
   environmentsSvc: Pick<ReturnType<typeof environmentService>, "getById" | "getLeaseById" | "releaseLease">;
   instructionCopies: Pick<ReturnType<typeof agentInstructionWorkingCopyService>, "recoverStopped" | "recoverCaptured">;
   runtimeEnv: Record<string, string | undefined>;
@@ -918,6 +921,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // whether any provider authority needs to be reopened.
     await reconcileNativeFinalizations(db, undefined, {
       environmentRuntime,
+      pluginWorkerManager: dependencies.pluginWorkerManager,
       onWorkspaceSettled: settleRecoveredNativeWorkspace,
     });
     await preserveCancelledNativeWorkspaces(db);
@@ -1959,6 +1963,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // mode, never the current feature flag.
     await reconcileNativeFinalizations(db, undefined, {
       environmentRuntime,
+      pluginWorkerManager: dependencies.pluginWorkerManager,
       onWorkspaceSettled: settleRecoveredNativeWorkspace,
     }).catch((error) => {
       logger.warn(
@@ -2361,6 +2366,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         !revokedState.processPid &&
         !revokedState.processGroupId;
       const shouldRetry =
+        !await pendingCaseHandoffForRun(db, run.id, run.companyId) &&
         (run.processLossRetryCount ?? 0) < 1 &&
         ((tracksLegacyLocalChild &&
           (!!run.processPid || !!run.processGroupId)) ||
