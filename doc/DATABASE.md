@@ -49,6 +49,41 @@ and leaves all existing cases passive. Source identities are not grants.
 
 ### Task query performance
 
+The issue-lock adapter's release read omits `result_json.stdout` and
+`result_json.stderr` before transferring a run to the controller. Every other result key, context field, and
+stop, retry, lease, and workspace-recovery check stays intact. Full output remains
+stored for execution history and detail reads. Terminal telemetry loads only its
+run identity, timestamps, usage, and typed task identifier.
+
+Recovery's latest-run queries return the context fields used by recovery
+decisions. Prompts, execution continuation bodies, and workspace setup payloads
+remain in the stored run and its full detail reads. These queries also return
+the PostgreSQL row version. Native blocked-wait repair compares that version
+against a fresh full source read before applying changes. Any intervening row
+update, including an edit outside the projection, defers repair to a fresh sweep.
+
+Execution-blocker reads select process, lifecycle, and task-binding fields rather
+than full execution rows. Context retains typed task and pre-dispatch evidence;
+Runner profiles retain the adapter type and complete native execution input and
+workspace-sync receipts. Full result evidence stays available to the existing
+retry and workspace checks. Stored context, profiles, and output are unchanged.
+
+Committed native finalization reads run identity and ownership state before it
+claims the coordinator. It loads complete saved input only when finalization
+still needs to process an accepted result. Review presentation retains the full
+result. Muse settlement reads its exact provider binding. Cleanup reads fresh
+status and ownership metadata; cancelled native workspace retention and legacy
+Stop settlement still load complete run evidence. Workspace settlement reads the
+saved sync descriptor, export retry, and first-heartbeat flag. These projections
+leave stored prompts, logs, results, and recovery state unchanged.
+
+Conversation ownership checks select process identity and full recovery result
+evidence without execution prompts or profiles. Committed native reply repair
+selects its persisted result and identity bindings plus typed presentation flags.
+It keeps its existing row locks, accepted-result digest checks, publication
+authorization, and selected-answer protections. Full execution history stays in
+storage.
+
 Run-context lookups use expression indexes for both `context_snapshot.issueId`
 and `context_snapshot.paperclipIssue.id`. Task creation provenance has its own
 company-scoped expression index that follows the query's native issue ID and
@@ -88,16 +123,70 @@ launch context does not travel with each policy or parent-report check. JSON
 types, task-key precedence, and company and agent identity checks are preserved.
 Each decision still reads current data; this is not an authorization cache.
 
+Native tool authority lookups select current run identity, status, invocation,
+responsible user, context, and receipt data. Saved profiles and output excerpts
+stay in storage and are omitted from that read. Task and agent binding, current
+status, budget, and task privacy checks retain their existing predicates.
+Mutation transactions still lock and read complete run records. The unlocked
+authority read also omits named launch renderings and preparation data that its
+tools do not consume. Ordinary tool checks also omit the wake payload. Mail
+checks load the current full wake to enforce external-chat restrictions. Other
+context and result receipts remain available. The complete saved context stays
+in storage for execution.
+
+WebSocket delivery uses one fresh authorization batch for an event's task and
+run bindings. When both bindings name the same task, the batch reads its current
+authority once. Different task bindings must both pass. The batch is discarded
+after that delivery; later events still recheck grants, membership, task
+existence, and company boundaries.
+
+Browser progress events update cached live run status directly. A successful
+patch does not refetch task details, activity, or run history. Unknown runs
+retain the existing refresh fallback. Run transitions, activity events, and
+reconnect recovery still refresh their affected data.
+
+Connection-assignment checks select profile bindings for the current company or
+agent and read rules that can match the selected connection's catalog rows.
+All five selector kinds, null application matching, exclusions, and profile
+precedence retain their existing evaluator. Rule filtering uses the catalog
+values already read by that check, so a later catalog change cannot drop an
+exclusion from the decision being evaluated. There is no cross-call cache.
+
 Filesystem preparation uses current task/run and selected-configuration checks.
 Historical root-reader authorization has been retired; no retained-reader batch is
 loaded at admission or publication. Workspace-record disclosure still uses task
 privacy checks, independently of filesystem access.
 
+Saved-message execution-wait scans read current run state, process ownership,
+startup and cancellation receipts, task binding, and the recorded adapter kind.
+Saved profiles, output excerpts, and unrelated launch context stay in storage.
+Continuation admission and its locked mutation reads retain their existing gates.
+
+Task creation provenance reads current run identity, scope, and task binding.
+Legacy task references retain their typed values and existing precedence. Saved
+profiles, output, and unrelated context stay in storage. Viewer access to the
+source task and run is still checked before provenance is returned.
+
 The initial agent JWT run lookup reads only the cancellation state and
 conversation flag from saved run JSON. It does not transfer the full context or
 result. Run status, responsible-user identity, company and agent boundaries,
 and the cancellation response remain unchanged. Later identity refreshes keep
-their existing transaction and data reads.
+their current authorization and transaction boundaries.
+
+Chat recovery ancestry selects task identifiers and source-run links instead
+of full execution payloads. Instruction authorization selects current identity
+fields and still rechecks accepted identity, key revocation, and membership.
+Identity task locks and activation receipts project typed legacy task keys with
+the native and first-class issue IDs. These projections preserve task binding
+precedence and validation without transferring prompts or output.
+
+Recovery's latest-run and legacy-continuation eligibility reads select structured
+result fields for error families,
+workspace/configuration receipts, cancellation attribution, retry deadlines, and
+conversation finalization. The `adapter_failed`, `provider_quota`, and
+`configuration_incomplete` classifiers retain full results because they inspect
+arbitrary provider error text. Stored results and execution/detail reads remain
+complete; no recovery decision is cached.
 
 To measure authentication query responses on disposable synthetic data:
 
@@ -279,6 +368,62 @@ DATABASE_MAX_LIFETIME_SECONDS=1800   # recycle a pooled connection after this lo
 DATABASE_APPLICATION_NAME=paperclip  # application_name in pg_stat_activity; default: paperclip
 ```
 
+### Bounded response diagnostics
+
+`PAPERCLIP_DB_RESPONSE_CAPTURE_WINDOW=<start>/<end>` enables one explicit UTC
+window. Both timestamps use ISO format ending in `Z`. The window lasts at most
+60 seconds and starts within 30 minutes. Unset, invalid, and expired windows
+leave database construction unchanged. An expired window stays inactive after a
+restart; remove the setting after the investigation.
+
+The diagnostic measures awaited Postgres.js `unsafe` responses before Drizzle
+column decoding. It retains the Drizzle builder caller for normal, prepared,
+transaction, and dedicated-pool execution. It issues no queries.
+It logs the public server caller locations, static schema table, operation,
+query/row counts, and response value sizes. It emits at most 2,048 aggregate
+groups and a summary. Measurement stops at the deadline. Environment-enabled
+captures emit at most 64 records per second and can take another 33 seconds to
+finish writing the bounded output. Wait for the summary before collecting it.
+It never logs SQL, parameters, result
+values, connection strings, or query errors. In-flight queries continue normally.
+
+For a bundled server, keep the linked source maps and enable Node's
+`--enable-source-maps` option so the diagnostic can resolve public caller
+locations. Restore the prior Node options after capture. Sizes still count when
+caller locations are unavailable.
+
+Look for `paperclip.db_response_capture.entry.v1` and
+`paperclip.db_response_capture.summary.v1` in the process logs. A log provider
+can store `event` as a structured field instead of message text. Filter by that
+field or read the bounded window from the exact deployment. Check the summary
+and group totals, including the unattributed overflow group.
+
+Fetch a complete capture as follows:
+
+1. Read the summary events from the exact deployment and window. Keep each
+   distinct `captureId` separately.
+2. Each entry has a unique `groupIndex` within that capture and a `groupPage`.
+   The summary gives `groupPageSize` (128) and `groupPages`. Fetch every page
+   from zero through `groupPages - 1`, filtering on the entry event, `captureId`,
+   and `groupPage`. Request at least `groupPageSize` matching records per page.
+   A structured query can use
+   `@event:paperclip.db_response_capture.entry.v1 AND @captureId:<id> AND @groupPage:0`.
+3. If the provider's record limit is smaller than a page, fetch each
+   `groupIndex` separately with the same capture ID. Each index matches one
+   entry. Do not split by timestamp: entries can share a timestamp.
+4. Deduplicate by `(captureId, groupIndex)`. Require every index from zero
+   through `groups - 1`, with no gaps. Entry count must equal `groups`, summed
+   `calls` must equal `completedQueries`, and summed `responseValueBytes` must
+   equal the summary total. A missing page is an incomplete measurement.
+
+Tagged raw-driver calls, streams, unawaited raw-driver
+dispatch, and protocol overhead are not measured. Relational queries use a driver-level caller fallback.
+Queries still in flight at the deadline are reported separately. Sizes describe
+driver values before column decoding, not billed network bytes. Complex parsed
+values use JSON size estimates, counted in `estimatedValues`. Reconcile them with
+provider metering and socket measurements. Serialization adds temporary CPU and memory work;
+measure the final transfer rate after the window expires.
+
 ### Push the schema
 
 ```sh
@@ -367,6 +512,13 @@ IDs and names, not complete tool definitions. They still resolve current profile
 bindings, selectors, exclusions, and installed connections on every call. The
 public effective-profile response continues to include complete tool schemas
 and annotations.
+
+Connection readiness checks use a scoped assignment reader. It applies the same
+current profile precedence, selectors, and exclusions to the candidate connection
+IDs. The reader selects rule match fields and catalog identities. It does not
+load rule conditions, catalog schemas, profile summaries, or the company-agent
+list. Installed connections and later identity and gateway checks remain fresh.
+Full effective-profile and effective-tool responses keep their complete shape.
 
 ## Execution identity row locks
 
@@ -706,6 +858,19 @@ pnpm secrets:migrate-inline-env --apply
 ```
 
 Hosted AWS provider notes live in [SECRETS-AWS-PROVIDER.md](./SECRETS-AWS-PROVIDER.md).
+
+Sandbox runtime configuration resolves a provider's secret-reference fields
+through its schema-only lookup. Each lookup reads the selected plugin ID
+and a SHA-256 hash of its current schema in one database statement. A matching
+retained schema is omitted from the query result. Selection order, schema
+changes, and deletion remain visible on the next lookup, without a time-based
+cache. A database error still fails the lookup.
+
+The retained schemas are private to one `Db` object, with at most 32 entries of
+64 KiB each in serialized form. Larger schemas still work and are read in full.
+Callers receive independent schema objects. This reuse stores neither resolved
+secrets nor authorization decisions. Default driver lookups still read complete
+current plugin records and enforce their existing readiness and worker checks.
 
 ### Persistent agent conversations
 
