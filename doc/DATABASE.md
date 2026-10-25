@@ -49,11 +49,24 @@ and leaves all existing cases passive. Source identities are not grants.
 
 ### Task query performance
 
+The attention feed checks for newer runs with company-scoped existence probes.
+The probes match the failed run's agent and issue or task context. They preserve
+the existing millisecond comparison and empty-context rules. Each batch holds
+at most 1,000 failed runs. Retained run history stays in the database; this check
+returns only the identifiers of failures that have a newer matching run.
+For failures without a task key, it reads the latest keyless timestamp once per
+agent. Unique agents are batched separately, so repeated failures do not repeat
+the same history scan. Both paths retain the current millisecond comparison.
+
 The issue-lock adapter's release read omits `result_json.stdout` and
-`result_json.stderr` before transferring a run to the controller. Every other result key, context field, and
-stop, retry, lease, and workspace-recovery check stays intact. Full output remains
-stored for execution history and detail reads. Terminal telemetry loads only its
-run identity, timestamps, usage, and typed task identifier.
+`result_json.stderr` before transferring a run to the controller. Native context
+also omits saved launch text, execution-continuation bodies, workspace and
+environment payloads, and the launch wake envelope. Task identity, retry and
+continuation controls, interaction and comment references, execution policy, unknown context fields, and every other
+result key stay intact. Legacy reads retain full context. Stop, retry, lease,
+and workspace-recovery checks do not change. Full inputs and output remain stored
+for execution history and detail reads. Terminal telemetry loads only its run
+identity, timestamps, usage, and typed task identifier.
 
 Recovery's latest-run queries return the context fields used by recovery
 decisions. Prompts, execution continuation bodies, and workspace setup payloads
@@ -62,11 +75,21 @@ the PostgreSQL row version. Native blocked-wait repair compares that version
 against a fresh full source read before applying changes. Any intervening row
 update, including an edit outside the projection, defers repair to a fresh sweep.
 
+The two preliminary reconciliation reads omit named launch renderings and
+preparation payloads. Native profiles omit unused native execution input.
+They retain all other context, full results, legacy profiles, task identity,
+retry accounting, and unknown controls. Native runs still reach their native
+recovery guard. Terminalization locks its current control state and returns
+full rows from its writes. Stored input remains intact.
+
 Execution-blocker reads select process, lifecycle, and task-binding fields rather
 than full execution rows. Context retains typed task and pre-dispatch evidence;
-Runner profiles retain the adapter type and complete native execution input and
-workspace-sync receipts. Full result evidence stays available to the existing
-retry and workspace checks. Stored context, profiles, and output are unchanged.
+Runner profiles retain the adapter type, native input schema, binding, provider,
+workspace-access evidence, and complete workspace-sync receipts. Native task and
+runtime prompt payloads are not needed for these checks. Missing fields and
+malformed input values retain their original shape. Full result evidence stays
+available to the existing retry and workspace checks. Stored context, profiles,
+and output are unchanged.
 
 Committed native finalization reads run identity and ownership state before it
 claims the coordinator. It loads complete saved input only when finalization
@@ -76,6 +99,17 @@ status and ownership metadata; cancelled native workspace retention and legacy
 Stop settlement still load complete run evidence. Workspace settlement reads the
 saved sync descriptor, export retry, and first-heartbeat flag. These projections
 leave stored prompts, logs, results, and recovery state unchanged.
+
+Settled native process release locks run identity, terminal state, process
+identity, and checkpoint presence without loading the checkpoint or execution
+payloads. It retains current coordinator checks, provider evidence, local-host
+identity checks, and every lease's termination receipt. The stop receipt and
+process-field update remain in the same transaction.
+
+Legacy terminalization locks runtime mode, status, full result evidence, and the
+status-delivery token without loading unused input, profile, or log bodies.
+It keeps the existing lock, full returned run, workspace-retention
+receipts, and source-bound recovery holds. Stored payloads remain unchanged.
 
 Conversation ownership checks select process identity and full recovery result
 evidence without execution prompts or profiles. Committed native reply repair
@@ -144,6 +178,28 @@ Browser progress events update cached live run status directly. A successful
 patch does not refetch task details, activity, or run history. Unknown runs
 retain the existing refresh fallback. Run transitions, activity events, and
 reconnect recovery still refresh their affected data.
+
+Task run queries stop interval polling only after a successful empty response
+and an open shared live connection for the current company and session. Initial
+reads, active work, errors, connection setup, and disconnections retain their
+existing polling cadence. Company or session changes require a new connection.
+Views without an assigned agent retain polling. Matching run lifecycle events
+refresh the displayed task's run queries independently of route and window
+focus. Events that omit task identity conservatively refresh these queries,
+including reviewer runs from another agent. One parent view owns both query
+observers and reuses refreshes already covered by the focused-route handler. A
+matching event that overlaps an older request queues a fresh read after that
+request settles. Connection readiness also reconciles the displayed run
+queries after any older request. Follow-up reads belong to the current mounted
+scope and stop when it changes or unmounts. The first open and reconnect still
+reconcile missed events.
+
+Bundled skill release checks read the current stored version ID and a SHA-256
+fingerprint of its file inventory. A per-database memo keeps at most 64 verified
+snapshots. It reuses a verification only when the current database fingerprint
+and current on-disk inventory hash both match. A changed or missing snapshot
+still follows full validation or seeding. Company access and local source
+reconciliation still run for each request; authorization is not cached.
 
 Connection-assignment checks select profile bindings for the current company or
 agent and read rules that can match the selected connection's catalog rows.
@@ -230,6 +286,32 @@ pnpm --filter @paperclipai/server exec tsx ../scripts/benchmark-workspace-author
 The benchmark loads the baseline authorization module with current dependencies,
 compares complete workspace rows, and prints five warm samples and query plans.
 It measures SQL execution, not the full repository admission or agent startup.
+
+Native finalization retries preserve a run's terminal completion time when its
+status is unchanged. A retry mints another status delivery only when the current
+run's status, finalization metadata, phase, error fields, or missing completion
+time changes. An unchanged projection retains its existing pending delivery ID,
+including after a publish failure. Status delivery stays at least once; retry
+deadlines, recovery, accepted results, and workspace cleanup still run normally.
+Legacy recovery also retains the pending delivery when status is unchanged and
+no patch was supplied. Explicit patches, new terminal statuses, and newly
+retained workspace evidence still create a delivery. File retention, ownership
+checks, failed write conditions, lock cleanup, and recovery holds still apply.
+The retention-evidence write returns another full run only when that evidence
+changes. An unchanged retry keeps the full run returned by the first write and
+still processes retained leases and recovery holds.
+
+Agent lists read the complete company roster once and use that same snapshot for
+termination filtering and organization-chain normalization. Detail and plugin runtime reads
+load only identity, company, name, status, and manager from other company agents
+for chain checks. The selected agent's full configuration, current monthly spend,
+and existing response redaction remain available. Every call reads current data;
+these lookups do not cache authorization or agent configuration.
+
+Queued-comment display filters wake requests by the current company, assigned
+agent, status, and exact JSON string task identity in SQL. Other tasks' comment
+identifiers stay in the database. The display projection, ordering, current run
+ownership checks, and persisted wake payloads retain their existing contract.
 
 ## 1. Embedded PostgreSQL — zero config
 
