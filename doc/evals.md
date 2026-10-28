@@ -1,5 +1,11 @@
 # Paperclip evaluation guide
 
+The explicit-only [chat feature evals](../tests/runner-e2e/CHAT-FEATURES.md) promote
+two natural-language task scenarios into local native Product E2E cells. They
+verify saving an unstarted task and delegating a saved announcement back to chat,
+using ordinary production instructions, real browser messages and independent
+state/provenance checks. The broader YAML catalog remains planning inventory.
+
 The explicit-only [Daytona restart continuity journey](../tests/runner-e2e/README.md)
 extends the existing native restart oracle to a 125-second controller outage,
 using the recorded Claude and Codex models in disposable development fixtures.
@@ -83,6 +89,12 @@ behavior.
   provider, and (where selected) Daytona, using an isolated instance and
   grading oracle. See [`tests/runner-e2e`](../tests/runner-e2e/README.md) and
   [Everyday Workflows](../tests/runner-e2e/EVERYDAY-WORKFLOWS.md).
+
+The [chat scenario catalog](../tests/runner-e2e/chat-scenarios/README.md) is a
+planning inventory within Product E2E: natural user requests, assumed context and
+expected outcomes linked to the feature and agent-access maps. It includes
+conditional setup, permission, approval and recovery journeys. Its YAML files
+are not registered runnable cells and contribute no passing coverage or scores.
 
 Runner Evals answer whether a real runner/provider can perform a bounded
 protocol operation against the expected control-plane contract. Product E2E
@@ -527,5 +539,7 @@ API and download oracles; no live qualification is implied by fixture registrati
 
 The explicit-only [feedback persistence case](../tests/runner-e2e/README.md#feedback-persistence-explicit-only)
 checks real native complaint/suggestion submissions and retained bodies with
-run-attributed tool receipts. It is manual, uses the normal Product E2E report,
+run-attributed tool receipts on local and Daytona execution. Its four native
+Claude/Codex cells are explicit-only. Remote registrations remain unqualified
+until retained live attempts prove them. It uses the normal Product E2E report
 and keeps synthetic feedback distinct from actionable product findings.
