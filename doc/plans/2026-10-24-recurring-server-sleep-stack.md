@@ -3052,3 +3052,182 @@ The owner audit preserves the wrong initial ordinary-release completion assertio
 and its authority-preserving correction. Fresh-head gates remain pending; nothing
 merged. Earlier E2E failures on #17490/#17572 and voice findings on #17576/#17580
 were revalidated and remain unresolved. All original remaining duties stay in scope.
+
+
+Slice 50 repaired-head acceptance: #17709 at
+`9a9e4262bb9beb39d67d26320c14e99651b6d6bd` now has all 53 checks passing,
+Greptile 5/5 at that exact head and zero unresolved review threads. Its PR body
+records the result and retains the local embedded-database limitation. It remains
+draft and unmerged. `/tmp/sleep50-release-latest-gates.json` records fresh CI.
+Older stack findings and master reconciliation remain outstanding.
+
+Slice 51 is now `codex/sleep-51-retained-native-session-cleanup`, based on that
+repaired head. The existing joined discovery has a cohesive native cleanup owner;
+scoped reconstruction preserves future lease deadlines. All 35 database discovery/
+finalization cases, 72 exact physical-cleanup cases and server types pass. See
+[the audit](2026-10-26-retained-native-session-cleanup-sleep-audit.md) for producer,
+physical-owner, shutdown and outcome gaps. No scheduled cleanup worker is wired
+and periodic cleanup remains enabled. The full scope remains incomplete.
+
+
+Slice 51 outcome checkpoint: pre-claim database/commit failures now propagate
+instead of being discarded as ineligible history. Typed waiting outcomes preserve
+process/session/environment/maintenance ownership and the actual coordinator lease
+expiry. Four injected failures, a real PostgreSQL row-lock regression and six
+waiting-state regressions reproduced the old behavior. The repaired source passes
+798 executor cases (15 embedded-DB cases excluded), 36 database cases and server
+types; strengthened physical reactivation tests pass all 80 selected cases again.
+The owner audit preserves the reused-fixture failure and initial fixture type error.
+Worker registration, producer/release notifications, quiet/lifecycle/cost proof,
+periodic removal and a slice 51 PR remain outstanding. No polling duty is claimed
+removed by this checkpoint; all original stack scope stays active and unmerged.
+
+
+Slice 51 worker checkpoint: retained cleanup now has scoped shared-scheduler
+reconstruction, exact lease deadlines, a concrete process-exit probe and event
+waiting for other owners. Startup/manual/scheduled attempts join duplicates and
+serialize different inspections. A real finalization-notification missed wake was
+reproduced and repaired through the existing transaction fanout. All 19 worker
+lifecycle cases, 36 existing cleanup/finalization cases, 37 reassessment consumer
+cases and server types pass. The 103-item backlog becomes SQL-quiet after settlement.
+Actual local/environment/process/maintenance producer coverage, physical callback
+drain ownership, large-history costs, startup wiring, periodic removal, publication
+and remote acceptance remain open. Periodic cleanup is still enabled; no new PR
+or merge is claimed and the full original stack scope stays active.
+
+
+Slice 51 durable release checkpoint: six real-producer missed wakes were
+reproduced and repaired: single/run-wide lease release, settled process release,
+stop-only cleanup, export-resume settlement and confirmed sandbox absence.
+Notifications remain run/company-scoped and tied to outer transaction ownership.
+All 208 selected worker/environment/workspace consumer cases and server types pass.
+The owner audit retains the asynchronous rollback-test failure and correction,
+and distinguishes controlled stop evidence from actual physical/provider proof.
+Local session and maintenance releases, remaining finalization producers, callback
+ownership, startup wiring, cost proof, periodic removal and PR gates remain open.
+Periodic cleanup remains enabled. No PR or merge; all original scope stays open.
+
+
+Slice 51 local owner checkpoint: session execution/initialization releases and
+all warm-session retirement paths now emit local scoped hints. Warm removal checks
+the expected owner; the existing close/retention decisions remain authoritative.
+Three lifecycle regressions reproduced missing release notifications. Final
+executor verification passes 798 cases (15 embedded-DB cases excluded), the real
+PostgreSQL worker suite passes 26 cases, and server types pass. Retained maintenance
+completion and physical callback ownership are next; the audit records the exact
+boundary gap. Startup registration, periodic removal, cost proof, remaining
+producers and PR acceptance remain incomplete. Nothing published or merged;
+all original recurring-server duties and older stack gates remain open.
+
+
+Slice 51 maintenance and terminal-producer checkpoint: cleanup now owns original
+Runner maintenance attempts/callbacks through settlement, using Runner's existing
+drain boundary. Finalizer projection and heartbeat terminal writes now notify
+cleanup in their transactions. Three reproduced producer regressions include the
+real separate-commit decision/projection race. All 64 worker/lifecycle cases,
+146 finalizer corpus cases, 799 selected executor cases, 19 Runner settlement
+cases and server types pass; 15 embedded-DB cases remain excluded for the recorded
+host limitation. The audit records earlier failures and fixture corrections.
+Startup wiring, query cost, periodic removal, full gates and publication remain.
+No PR or merge; the complete recurring-server scope and older stack gates stay open.
+
+
+Slice 51 startup integration: the enabled server now registers retained cleanup
+and its shutdown subscription. The periodic orphan pass skips this duty; explicit
+and startup recovery retain their bounded joined sweep. Heartbeat joins original
+scheduled physical operations through shutdown. All 100 startup/worker cases and
+server types pass. After the user's explicitly approved cleanup of 11 orphaned
+semaphore sets, the full executor suite passes all 814 cases with no exclusions,
+including strengthened initialization-release coverage. A 10,000-completed-session
+probe measures broad discovery at 28–30 ms locally and run-scoped discovery at
+0.030 ms; broad discovery remains linear in history and no deployed claim is made.
+Full workspace acceptance, PR publication/review, older gates and every remaining
+duty stay open. No merge has occurred.
+
+
+Slice 51 publication: [#17717](https://github.com/paperclipai/paperclip/pull/17717)
+is draft on #17709. Published head `8c62a6b0c0` passed workspace types/build and
+received Greptile 5/5, but three CI gates failed: two tests retained the old
+heartbeat-owned maintenance drain, and the Copilot transport identity was stale.
+The repair follows the cleanup-owned lifetime and creates a new attestation while
+preserving old profile history. Full affected recovery/process suites (34 + 408)
+and profile tests (69) pass. The local whole-suite OAuth timeout is retained in
+the audit alongside a passing complete 472-case isolated rerun. Latest-head CI
+and review acceptance are still pending; no stack PR is merged.
+
+The next native finalization audit identifies three distinct remaining duties:
+workspace copy-back/validation; accepted-result commit/projection; and resource
+settlement after finalization. Current committed-history upkeep repeatedly calls
+finalization and best-effort cleanup, including swallowed resource-release
+failures. A completed result cannot be used as proof that those residual duties
+are finished. Audit first-result publication in `paperclip-control-plane-port.ts`,
+workspace operation writes, durable workspace-owner release, retry updates and
+cleanup completion before disabling their existing recovery paths. No migration
+of these next duties is claimed by slice 51.
+
+## 2026-10-26: verified slice 51 and workspace-finalization migration
+
+[#17717](https://github.com/paperclipai/paperclip/pull/17717) is verified at
+`d0036fce3e039e91ab2bf2602e3e6a87a4476491`: all 56 remote check/status entries
+passed or intentionally skipped, Greptile 5/5 on that head, and no unresolved
+review threads. It remains draft/open and unmerged. The older local full-suite
+run was interrupted with exit 130 after current-head CI passed; do not count it
+as a local full-suite pass. The separate local resource-limit failure remains
+recorded. The explicitly approved 11 semaphore sets were removed once.
+
+Slice 52 is `codex/sleep-52-native-workspace-finalization` on that parent.
+[Its audit](2026-10-26-native-workspace-finalization-sleep-audit.md) records the
+copy-back obligation, exact owner/proof outcomes, commit/release producers,
+shared-scheduler integration, and 12 passing real-database lifecycle cases.
+The periodic orphan pass skips only this physical-copyback duty. Result projection
+and resource settlement retain existing recovery and are the next separate slices.
+Final full verification, publication and review are pending for slice 52. Inspected
+master is `a1f77821b9cd5c9c846fdf7a0fa5cc620ad2b6bb`; stack-base propagation is
+still outstanding. Older gates (#17490, #17572, #17576, #17580) and the rest of the
+requested recurring-server inventory remain active. No merge is authorized.
+
+Slice 52 publication: [#17734](https://github.com/paperclipai/paperclip/pull/17734)
+is draft on #17717. Workspace types/build passed. The initial broad command had
+582 passes and 88 board-action failures from incorrectly shared external test
+fixtures; it is not a pass. Separate databases then pass all 203 cases in four
+complete follow-up suites. A reproduced stale-success-barrier regression is
+fixed: result reconciliation prefers the existing successful scoped receipt even
+when a stale controller later writes failure, without repeating copy-back.
+The worker lifecycle now passes all 13 cases. Full-command disposition and
+repaired-head remote gates remain pending. No merge; all older gates and later
+recurring duties remain in scope.
+
+Slice 52 review repair: initial Greptile 3/5 identified the already-reproduced
+stale barrier and missing heartbeat execution-suppression checks. Restore/worktree
+regressions both failed red through public heartbeat registration. The worker now
+consults the owning suppression policy before discovery/execution, and worktree
+activation publishes a reconstruction signal. All 15 lifecycle cases pass,
+including real settings activation after quiet. Latest validation/review are still
+pending; the scope remains active with no merge.
+
+
+Slice 52 startup repair: Greptile reached 5/5 at `020ccbc66d` with both threads
+resolved, but CI server shard 4/12 found a missing startup fixture method. Added
+that method and enabled/disabled lifecycle coverage, then corrected the exact
+periodic skip expectation. All 74 startup cases pass. The old-head default local
+full run was deliberately interrupted (Vitest 130, wrapper 1) before editing;
+it is not a pass. Remote gates and review on the repaired head remain pending.
+
+Follow-up audit: eight earlier native worker registrations gate task drain but
+lack the new worker's restore/worktree suppression boundary: retained session
+cleanup, status reassessment, governed response, response presentation, pending
+effects, unsafe exports, automatic completion review and obsolete policy review.
+Verify each duty's prior suppression contract and its settings activation wake
+before declaring it safe. This is outstanding stack acceptance work, not a claim
+that every listed duty has the same defect. All remaining duties and older gates
+remain active; no merge is authorized.
+
+
+Slice 52 producer audit correction: the hidden PRP coordinator has a second
+accepted-result writer. Added its missing transaction-aware workspace hint after
+two red real-producer regressions. The complete lifecycle suite passes all 18
+cases, covering first result plus outer commit/rollback for both writer paths.
+The previous head's startup gate passed, with Greptile 5/5. A separate CI import
+hook timeout (118 agent-skills cases skipped) passed all 118 locally and received
+one justified job retry. New producer-fix acceptance remains pending. No merge;
+all prior gate, suppression-audit and remaining-duty obligations remain open.
