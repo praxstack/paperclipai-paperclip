@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
-import { isStorageUnavailableError, sendThroughStorageOutage, waitOutStorageOutages } from "../storage/storage-unavailable.js";
+import { isStorageUnavailableError, sendThroughStorageOutage, storageOutageWaitFor, waitOutStorageOutages } from "../storage/storage-unavailable.js";
 import { measureRunPhase, type ExecutionPhase } from "./execution-preparation-timing.js";
 import { collectStorageRequestStats, newStorageRequestStats, type StorageRequestStats } from "../storage/request-stats.js";
 import { constants, createReadStream, createWriteStream } from "node:fs";
@@ -105,6 +105,31 @@ export async function getWorkspaceSnapshot(db: Db, input: { companyId: string; w
   return row && ["uploaded", "committed", "superseded"].includes(row.status) ? reference(row) : null;
 }
 
+export async function findUnchangedWorkspaceSnapshot(input: {
+  db: Db; storage: StorageService; snapshot: SnapshotRow; manifestDigest: string; archiveSha256: string; archiveBytes: number;
+  timing?: WorkspaceSnapshotStorageTiming;
+}): Promise<WorkspaceSnapshotRef | null> {
+  return withRequestStats(input.timing, async () => {
+    const { snapshot } = input;
+    if (!snapshot.parentSnapshotId || snapshot.status !== "pending" || snapshot.objectKey !== null
+      || snapshot.sha256 !== null || snapshot.byteSize !== null || snapshot.key !== null || snapshot.manifestDigest !== null
+      || snapshot.metadata?.uploads !== undefined
+        && (!Array.isArray(snapshot.metadata.uploads) || snapshot.metadata.uploads.length !== 0)) return null;
+    const [parent] = await input.db.select().from(executionWorkspaceSnapshots).where(and(
+      eq(executionWorkspaceSnapshots.companyId, snapshot.companyId),
+      eq(executionWorkspaceSnapshots.executionWorkspaceId, snapshot.executionWorkspaceId),
+      eq(executionWorkspaceSnapshots.id, snapshot.parentSnapshotId),
+      eq(executionWorkspaceSnapshots.status, "committed"),
+      eq(executionWorkspaceSnapshots.manifestDigest, input.manifestDigest)));
+    if (!parent) return null;
+    const ref = reference(parent);
+    const key = await snapshotKey(ref);
+    if (key.plaintextSha256 !== input.archiveSha256 || key.plaintextBytes !== input.archiveBytes) return null;
+    const head = await input.storage.headObject(ref.companyId, ref.objectKey);
+    return head.exists && head.contentLength === ref.byteSize ? ref : null;
+  });
+}
+
 export async function recoverWorkspaceSnapshotArchive(input: {
   db: Db; storage: StorageService; snapshotId: string; companyId: string; workspaceId: string;
   targetPath: string; signal?: AbortSignal;
@@ -175,7 +200,7 @@ type WorkspaceSnapshotUpload = {
 
 /** Upload attempts are journaled before remote I/O. The caller owns publication. */
 export async function uploadWorkspaceSnapshot(input: WorkspaceSnapshotUpload): Promise<WorkspaceSnapshotRef> {
-  return withRequestStats(input.timing, () => waitOutStorageOutages(() => uploadWorkspaceSnapshotTimed(input)));
+  return withRequestStats(input.timing, () => waitOutStorageOutages(() => storageOutageWaitFor("saving the workspace", () => uploadWorkspaceSnapshotTimed(input))));
 }
 
 async function uploadWorkspaceSnapshotTimed(input: WorkspaceSnapshotUpload): Promise<WorkspaceSnapshotRef> {
@@ -371,7 +396,7 @@ export async function loadWorkspaceSnapshotArchive(input: {
   /** Receives per-step durations and storage request counts. */
   timing?: WorkspaceSnapshotStorageTiming;
 }): Promise<void> {
-  return withRequestStats(input.timing, () => waitOutStorageOutages(() => loadWorkspaceSnapshotArchiveTimed(input)));
+  return withRequestStats(input.timing, () => waitOutStorageOutages(() => storageOutageWaitFor("restoring the workspace", () => loadWorkspaceSnapshotArchiveTimed(input))));
 }
 
 async function loadWorkspaceSnapshotArchiveTimed(input: Parameters<typeof loadWorkspaceSnapshotArchive>[0]): Promise<void> {

@@ -1,14 +1,19 @@
 /** Shared types for the control-plane restart chaos harness (plan §5). */
-import type { ProviderFaultEvent, ProviderFaultKind, ProviderFaultRule, ProviderMessage } from "./provider-faults.js";
+import type { ProviderFaultEvent, ProviderFaultKind, ProviderFaultRule, ProviderMessage, ProviderRestartKind } from "./provider-faults.js";
 import type { QuestionArtifacts, QuestionRecord } from "./question-handoff.js";
+import type { RepeatedRestartRecord, RestartStep } from "./repeated-restarts.js";
 import type { TimeFaultRecord } from "./time-faults.js";
 
 /**
  * K14 (upgrade mid-run): a graceful stop, then the replacement starts from the current build (`--upgrade-from`).
  * TM1–TM3 (time faults, time-faults.ts): freeze the server, sleep with aged rows, or an aged outage.
+ * RR1–RR3 (repeated restarts, repeated-restarts.ts): a K1, then more restarts while the replacement recovers.
+ * MS1–MS3 (two servers, one database, multi-server.ts): a second server beside the first.
  */
-export const FAULT_KINDS = ["K1", "K2", "K4", "K6", "K14", "TM1", "TM2", "TM3"] as const;
+export const FAULT_KINDS = ["K1", "K2", "K4", "K6", "K14", "TM1", "TM2", "TM3", "RR1", "RR2", "RR3", "MS1", "MS2", "MS3"] as const;
 export type FaultKind = (typeof FAULT_KINDS)[number];
+/** The shortest seeded K4 outage (scheduler.ts K4_HOLD_RANGE_MS), also the K4 hold after a provider fault. */
+export const K4_MIN_HOLD_MS = 120_000;
 /**
  * A task's planned fault. "K13" (restart storm) tasks have none of their own; the wave's storm crosses them.
  * PV1–PV3 (provider message faults, provider-faults.ts) restart nothing: the task's rule is armed in the Codex shim.
@@ -29,7 +34,8 @@ export type AdapterId = (typeof ADAPTER_IDS)[number];
 
 /** `asked` and `answered`: the journey boundaries of Q1–Q3 (journeys.ts, question-handoff.ts). */
 export const TRIGGER_IDS = ["time", "comment", "retry", "queued", "tool", "result", "approval", "paused", "stop", "asked", "answered"] as const;
-export type TriggerId = (typeof TRIGGER_IDS)[number];
+/** `provider` is not a `--triggers` choice: `--provider-fault-restart` schedules it (K1 after a provider fault applied). */
+export type TriggerId = (typeof TRIGGER_IDS)[number] | "provider";
 
 export const ENVIRONMENT_KINDS = ["local", "daytona"] as const;
 export type EnvironmentKind = (typeof ENVIRONMENT_KINDS)[number];
@@ -90,14 +96,17 @@ export interface WaveOptions {
   upgradeFrom?: string;
   workspaceRepo?: string;
   storage?: "s3";
-  storageFaults?: Array<"ST1" | "ST2" | "ST3">;
+  storageFaults?: Array<import("./storage-chaos.js").StorageFaultKind>;
   storageFaultMs?: [number, number];
   storageWindows?: import("./storage-chaos.js").StorageFaultWindow[];
+  storageTrigger?: import("./storage-trigger.js").StorageTriggerTarget;
   workspaceCommit?: string;
   workspaceGitUrl?: string;
   /** Provider message faults from `--faults` (PV1 delay, PV2 drop, PV3 duplicate); see provider-faults.ts. */
   providerFaults?: ProviderFaultKind[];
   providerFaultMessage?: ProviderMessage;
+  /** `--provider-fault-message S1=interrupt_ack,...`: a workload's own message, over `providerFaultMessage`. */
+  providerFaultMessageByWorkload?: Partial<Record<WorkloadId, ProviderMessage>>;
   /** PV1 delays, cycled across tasks (`--provider-fault-delays`). */
   providerFaultDelaysMs?: number[];
   /** `--db-pressure <writers>`: harness-owned writers touching the wave's running run rows back to back (contention.ts). */
@@ -108,6 +117,15 @@ export interface WaveOptions {
   serverFrom?: string;
   /** TM2/TM3: how far every database timestamp is shifted back (`--time-age-hours`, default 26 h). */
   timeAgeMs?: number;
+  /** `--provider-fault-restart K1`: each PV1/PV2 task also restarts the control plane after its fault applied. */
+  providerFaultRestart?: ProviderRestartKind;
+  /** `--provider-fault-restart K2,K4,K1`: restart kinds cycled across PV1/PV2 tasks (the first is `providerFaultRestart`). */
+  providerFaultRestartKinds?: ProviderRestartKind[];
+  providerFaultRestartAfterMs?: number;
+  /** RR1–RR3: the gap from a replacement's health to the next stop (`--rr-gap-seconds`); absent keeps each kind's default. */
+  rrGapMs?: [number, number];
+  /** RR1–RR3 (`--rr-stop-on recovering`): stop each replacement on its first `recovering` status instead of after a gap. */
+  rrStopOn?: "recovering";
 }
 
 export interface StormFault {
@@ -145,6 +163,8 @@ export interface TaskPlan {
   replayFaults?: ScheduledFault[];
   /** PV1–PV3 tasks: the provider message rule armed for this task's nonce. */
   providerFault?: ProviderFaultRule;
+  /** RR1–RR3: the seeded restarts after the first kill. */
+  restartSteps?: RestartStep[];
 }
 
 export interface ScheduledFault {
@@ -152,6 +172,8 @@ export interface ScheduledFault {
   atMs: number;
   trigger?: TriggerId;
   delayMs?: number;
+  /** RR1–RR3: the restarts after the first kill. */
+  restartSteps?: RestartStep[];
 }
 
 export interface WavePlan {
@@ -178,6 +200,8 @@ export interface RunSample {
   startedAt: string | null;
   finishedAt: string | null;
   errorCode: string | null;
+  /** Bounded code naming why a generic `errorCode` (such as `adapter_failed`) failed, e.g. `40001`. */
+  failureCause?: string | null;
   retryOfRunId: string | null;
   wakeCommentIds: string[];
   livenessState: string | null;
@@ -186,6 +210,8 @@ export interface RunSample {
   toolInFlight?: boolean;
   /** The run's recorded local runner process is still running with the same start time. */
   processAlive?: boolean;
+  /** A provider turn started and has no turn terminal yet. */
+  providerTurnActive?: boolean;
 }
 
 export interface InterruptionSample {
@@ -231,7 +257,8 @@ export interface FaultReceipt {
   kind: FaultKind;
   /** Task that scheduled the fault; every other running task is also exposed. */
   requestedBy: string;
-  signal: "SIGKILL" | "SIGTERM" | "SIGSTOP";
+  /** "none": MS1 sends no signal to the primary server. */
+  signal: "SIGKILL" | "SIGTERM" | "SIGSTOP" | "none";
   holdMs: number;
   requestedAt: number;
   startedAt: number;
@@ -250,6 +277,10 @@ export interface FaultReceipt {
   upgrade?: { fromRoot: string; fromSha: string | null; toRoot: string; toSha: string | null; switched: boolean };
   /** TM1–TM3: what was frozen and which rows were aged. */
   timeFault?: TimeFaultRecord;
+  /** RR1–RR3: every stop and replacement of the sequence, the first kill included. */
+  repeatedRestart?: RepeatedRestartRecord;
+  /** MS1–MS3: the second server and what happened to the first. */
+  multiServer?: import("./multi-server.js").MultiServerRecord;
   serverLogOffsetAtStart: number;
   serverLogOffsetAtReady: number | null;
   error: string | null;
@@ -368,6 +399,8 @@ export interface TaskRecord {
   question?: QuestionRecord;
   /** Q2, Q3: the board's journey actions (journey-driver.ts). */
   journey?: import("./journeys.js").JourneyRecord;
+  /** PV with `--provider-fault-restart`: when the shim logged the task's fault (arms the `provider` trigger). */
+  providerFaultAppliedAt?: number;
 }
 
 export interface TaskGrade {
