@@ -1,5 +1,5 @@
 import { settleOwnableKind } from "../recovery/ownership-invariant-report.js";
-import { markRunHandedOffForShutdown } from "./shutdown-handoff.js";
+import { isRunHandedOffForShutdown, markRunHandedOffForShutdown } from "./shutdown-handoff.js";
 import { ORPHANED_RUN_LEASE_FAILURE_REASON } from "../environment-run-lease-settlement.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "../environment-lease-controller.js";
 import { readNativeStartupCleanup, readNativeStartupContext } from "../native-runtime/native-startup-cleanup.js";
@@ -124,6 +124,7 @@ import type { environmentRuntimeService, ProviderResourceDisposition } from "../
 import type { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import type { createHeartbeatRunState } from "./run-state.js";
 import { failedRunRetryBudgetSpent, type HeartbeatRetryDependencies, type createHeartbeatRetries } from "./retries.js";
+import { serverRestartBudgetSpent } from "../execution-recovery-attempt.js";
 import type { CancelRunOptions } from "./run-control.js";
 import { requestRestartInterruptedTurnRetry } from "./restart-interrupted-turn.js";
 
@@ -478,7 +479,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     enterShutdown();
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
-      logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
+      logger.warn({ idleSessions }, "idle native session cleanup failed before controller shutdown");
     }
     let intent: Awaited<ReturnType<typeof readHotRestartIntent>>;
     try {
@@ -1009,6 +1010,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         },
         db,
         liveRunExecutions: activeRunExecutions,
+        handedOffForShutdown: isRunHandedOffForShutdown,
         runIds,
         restartKind,
         recoveryRequestId: intent?.recoveryRequestId ?? null,
@@ -2660,8 +2662,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         continue;
       }
       // A legacy controller persists "dispatching" in the same lease renewal
-      // that admits the adapter. An expired lease from another boot that is
-      // still "preparing" proves a restart stopped setup before provider work.
+      // that admits the adapter. An expired lease that is still "preparing"
+      // proves setup stopped before provider work.
       // Use the state committed with the revocation, not the earlier snapshot:
       // the old controller may have dispatched before its lease expired.
       // The revocation matched the snapshot's boot ID before replacing it.
@@ -2669,9 +2671,15 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         run.runtimeMode === "legacy" &&
         revokedState.executionStage === "preparing" &&
         !!run.controllerBootId &&
-        run.controllerBootId !== legacyControllerBootId &&
         !revokedState.processPid &&
         !revokedState.processGroupId;
+      // The run's owner was another server boot: a restart or replacement
+      // ended it, not the agent's work. Its continuation uses the
+      // server-restart lane (scheduleBoundedRetryForRun), never the failure
+      // budget, and a conversation adapter continues with a fresh turn.
+      const controllerReplaced = run.runtimeMode === "legacy" && !!run.controllerBootId
+        && run.controllerBootId !== legacyControllerBootId;
+      const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
       const shouldRetry =
         !await pendingCaseHandoffForRun(db, run.id, run.companyId) &&
         // Process loss spends the durable failure retry budget that
@@ -2679,11 +2687,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         // "Shutdown, process loss, and provider failure"). Checking it here
         // keeps "retrying once" honest and lets an exhausted chain fall
         // through to the interaction continuation path below.
-        !failedRunRetryBudgetSpent(run) &&
+        // A conversation run that a restart ended draws on the server-restart
+        // bound only. Other adapters keep the failure budget: a spent one
+        // holds them for reconciliation (legacyExecutionNeedsReconciliation).
+        !(controllerReplaced && conversationContinuationEligible
+          ? serverRestartBudgetSpent(run, now) : failedRunRetryBudgetSpent(run)) &&
         ((tracksLegacyLocalChild &&
           (!!run.processPid || !!run.processGroupId)) ||
           restartInterruptedBeforeDispatch ||
-          monitorDispatchLostWithoutFutureWake);
+          monitorDispatchLostWithoutFutureWake ||
+          (controllerReplaced && conversationContinuationEligible));
       const baseMessage = buildProcessLossMessage(run);
       const processLossDiagnostic = buildProcessLossDiagnostic({
         run,
@@ -2691,8 +2704,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         observerStartedAtMs: performance.timeOrigin,
         checksPersistedChildLiveness,
         retryEligible: shouldRetry,
+        controllerReplaced,
       });
-      const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
 
       const failureWrite = await setRunStatusFromLive(
         run.id,

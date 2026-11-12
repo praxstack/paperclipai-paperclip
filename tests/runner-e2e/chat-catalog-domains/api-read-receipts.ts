@@ -16,6 +16,15 @@ export const callApiInputDigest = (input: Record<string, unknown>) => nativeSha2
 const objectRecord = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const PAGE_LIMITS = Array.from({ length: 1001 }, (_, index) => index).flatMap(limit => [{ limit }, { limit: String(limit) }]);
 const cache = new Map<string, ReadonlySet<string>>();
+const CASE_READ_OPERATION = "GET /api/cases/{id}";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// The first page of the case record section (the default), which carries the case's status and completion.
+// Fields-only pages and byte-limited pages may omit them, so they do not count as reading the case.
+// An explicit limit equal to the default page size (8 KiB, also the maximum) reads the same page.
+const CASE_FIRST_PAGES: ReadonlyArray<Record<string, unknown>> = [undefined, "case"].flatMap(section => [undefined, 0].flatMap(offsetBytes =>
+  [undefined, 8 * 1024].map(limitBytes => ({ ...(section ? { section } : {}), ...(offsetBytes !== undefined ? { offsetBytes } : {}),
+    ...(limitBytes !== undefined ? { limitBytes } : {}) }))));
+const caseReadTool = (name: unknown) => typeof name === "string" && /^(?:[A-Za-z0-9_-]*__)?(?:paperclip_)?read_case$/.test(name);
 
 export interface ApiRead {
   operationId: string;
@@ -34,6 +43,10 @@ export function apiReadDigests(reads: readonly ApiRead[]): ReadonlySet<string> {
   const digests = new Set<string>();
   for (const read of reads) {
     const queries: Array<Record<string, unknown> | undefined> = [undefined, {}, ...(read.paged ? PAGE_LIMITS : []), ...(read.queries ?? [])];
+    // The dedicated read_case tool saves its own redacted input and reports GET /api/cases/{id}. Its first page of
+    // the case record is `{ caseId, section?: "case", offsetBytes?: 0 }` (caseReadPageShape).
+    if (read.operationId === CASE_READ_OPERATION) for (const pathParams of read.pathParams)
+      if (pathParams?.id && UUID.test(pathParams.id)) for (const page of CASE_FIRST_PAGES) digests.add(callApiInputDigest({ caseId: pathParams.id, ...page }));
     for (const pathParams of read.pathParams) for (const query of queries) {
       digests.add(callApiInputDigest({ operationId: read.operationId, ...(pathParams ? { pathParams } : {}), ...(query ? { query } : {}) }));
       if (!pathParams) digests.add(callApiInputDigest({ operationId: read.operationId, pathParams: {}, ...(query ? { query } : {}) }));
@@ -49,8 +62,32 @@ export function recordParams(name: string, ...values: Array<string | null | unde
 }
 
 /**
- * Statuses of this run's call_api results whose saved input digest is one of
- * `digests`, paired to their tool_use by run and item id.
+ * Dedicated task read tools and the call_api input the server builds for them
+ * (taskBridgeApiRequest in paperclip-runner-tool-authority.ts). Their saved
+ * tool_use keeps the plaintext taskId, while the result carries the same
+ * redacted receipt (apiOperationId, ok, status) as call_api. Harnesses may
+ * namespace the name (paperclip_get_task, mcp__paperclip__get_task).
+ */
+const TASK_READ_TOOLS: Readonly<Record<string, string>> = {
+  get_task: "GET /api/issues/{id}",
+  list_task_documents: "GET /api/issues/{id}/documents",
+  read_task_document: "GET /api/issues/{id}/documents/{key}",
+};
+function taskReadTool(name: unknown): string | undefined {
+  const match = typeof name === "string" ? /^(?:[A-Za-z0-9_-]*__)?(?:paperclip_)?([a-z_]+)$/.exec(name) : null;
+  return match && Object.hasOwn(TASK_READ_TOOLS, match[1]!) ? match[1] : undefined;
+}
+function taskReadInput(tool: string, input: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (typeof input.taskId !== "string" || !input.taskId) return;
+  if (tool === "read_task_document" && (typeof input.key !== "string" || !input.key)) return;
+  return { operationId: TASK_READ_TOOLS[tool], pathParams: { id: input.taskId, ...(tool === "read_task_document" ? { key: input.key } : {}) } };
+}
+
+/**
+ * Statuses of this run's record reads whose input digest is one of `digests`,
+ * paired to their tool_use by run and item id: call_api uses by their saved
+ * digest, and dedicated task read tools by the digest of the call_api input
+ * the server builds from their plaintext input.
  */
 export function apiReadStatuses(events: readonly Record<string, unknown>[], digests: ReadonlySet<string>): Array<{ operationId: string; ok: boolean; status: number }> {
   const uses = new Map<string, string>();
@@ -61,6 +98,20 @@ export function apiReadStatuses(events: readonly Record<string, unknown>[], dige
     if (item.type === "tool_use" && item.name === "call_api") {
       const input = objectRecord(item.input);
       if (input.apiPayloadRedacted === true && typeof input.operationId === "string" && digests.has(String(input.apiPayloadSha256))) uses.set(`${run}:${String(item.id)}`, input.operationId);
+      continue;
+    }
+    if (item.type === "tool_use" && caseReadTool(item.name)) {
+      const input = objectRecord(item.input);
+      // Saved redacted as `read_case`; a namespaced name may keep its plaintext `{ caseId }`.
+      const digest = input.apiPayloadRedacted === true ? String(input.apiPayloadSha256)
+        : typeof input.caseId === "string" && Object.keys(input).length === 1 ? callApiInputDigest({ caseId: input.caseId }) : undefined;
+      if (digest && digests.has(digest)) uses.set(`${run}:${String(item.id)}`, CASE_READ_OPERATION);
+      continue;
+    }
+    const tool = item.type === "tool_use" ? taskReadTool(item.name) : undefined;
+    if (tool) {
+      const request = taskReadInput(tool, objectRecord(item.input));
+      if (request && digests.has(callApiInputDigest(request))) uses.set(`${run}:${String(item.id)}`, String(request.operationId));
       continue;
     }
     if (item.type !== "tool_result") continue;
