@@ -445,6 +445,35 @@ test('repair source metadata binds the corrected candidate and explicit changed 
   [
     "questions-and-approvals.necessary-question",
     "expectedOutcome"
+  ],
+  // Full cohort 5: "this task" in a chat read as the chat itself; the query names the Website task.
+  [
+    "tasks.assignment-conflict",
+    "originalQuery"
+  ],
+  [
+    "recovery.explain-stall",
+    "originalContext"
+  ],
+  [
+    "recovery.explain-stall",
+    "expectedOutcome"
+  ],
+  [
+    "recovery.retry-exhausted",
+    "originalContext"
+  ],
+  [
+    "recovery.retry-exhausted",
+    "expectedOutcome"
+  ],
+  [
+    "recovery.source-action",
+    "originalContext"
+  ],
+  [
+    "recovery.source-action",
+    "expectedOutcome"
   ]
 ]);
   for (const change of repair.changedFields) {
