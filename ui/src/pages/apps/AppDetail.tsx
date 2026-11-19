@@ -1,6 +1,6 @@
 import { AppNotFound, AppReadError } from "./app-detail/AppReadError";
 import { AiConnectionPoolConnector } from "@/components/ai-connections/AiConnectionPoolConnector";
-import { aiConnectionRouterPluginKey, googleWorkspaceSelectedScopes, type GoogleWorkspaceServiceSelection } from "@paperclipai/shared";
+import { aiConnectionRouterPluginKey, googleWorkspaceSelectedScopes, paperclipPeerFromMcpUrl, paperclipPeerInstructionTemplate, type GoogleWorkspaceServiceSelection } from "@paperclipai/shared";
 import { ConnectionInstructionsSettings } from "@/features/connections/ConnectionInstructions";
 import { HonchoWorkspaceSettings } from "@/features/connections/HonchoWorkspaceSettings";
 import { BrowserUseSettingsPanel } from "./app-detail/BrowserUseSettingsPanel";
@@ -38,6 +38,7 @@ import { buildCompanyUserProfileMap } from "@/lib/company-members";
 import { installStateFrom, type InstallState } from "@/lib/tool-installs";
 import { useAuthorizationWindow } from "@/hooks/useAuthorizationWindow";
 import { useGoogleWorkspaceServiceGate } from "@/features/connections/GoogleWorkspaceServices";
+import { connectionRemovalToast } from "@/features/connections/googleAccessRemoval";
 import { QueryErrorState, useQueryView } from "@/components/QueryView";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -80,6 +81,7 @@ import {
   connectionOwnerProfile,
 } from "./connection-owner";
 import { describeError } from "@/api/errors";
+import { ANALYTICS_MASK_CLASS } from "@/lib/analytics/privacy";
 
 export { connectionAddress, connectionTransportLabel };
 
@@ -232,6 +234,13 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
     () => galleryEntryFor((galleryQuery.data?.apps ?? []) as AppGalleryDisplayEntry[], connection, application),
     [galleryQuery.data, connection, application],
   );
+  // Curated apps carry their own template. A connection to another Paperclip
+  // gets one derived from its address, so its default guidance stays editable.
+  const instructionsTemplate = useMemo(() => {
+    if (logoEntry?.agentInstructions) return { provider: logoEntry.name, template: logoEntry.agentInstructions };
+    const peer = paperclipPeerFromMcpUrl(typeof connection?.config?.url === "string" ? connection.config.url : null);
+    return peer ? { provider: peer.host, template: paperclipPeerInstructionTemplate(peer) } : null;
+  }, [logoEntry, connection]);
   const brandKey = appApplicationSourceSlug(application)
     ?? appConnectionSourceSlug(connection)
     ?? (logoEntry ? appDefinitionSlug(logoEntry) : null);
@@ -316,11 +325,16 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
   const agents = agentsQuery.data ?? [];
   const disconnectRemote = useMutation({
     mutationFn: () => toolsApi.archiveConnection(connectionId),
-    onSuccess: () => {
+    onSuccess: (removed) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.tools.connections(selectedCompanyId!) });
       queryClient.invalidateQueries({ queryKey: queryKeys.tools.connection(connectionId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.tools.applications(selectedCompanyId!) });
       queryClient.invalidateQueries({ queryKey: queryKeys.apps.attention(selectedCompanyId!) });
+      pushToast(connectionRemovalToast({
+        title: "Disconnected",
+        body: "The connection was removed and agents can no longer use it.",
+        providerAccess: removed?.removal?.providerAccess,
+      }));
       navigate("/apps");
     },
     onError: (error) => pushToast({ title: "Couldn't disconnect", body: describeError(error).body, tone: "error" }),
@@ -540,7 +554,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
 
   if (isRetiredComposioConnection(connection)) {
     return <div className="max-w-4xl space-y-6 pb-12">
-      <h1 className="text-xl font-semibold">{appName}</h1>
+      <h1 className={cn("text-xl font-semibold", ANALYTICS_MASK_CLASS)}>{appName}</h1>
       <section role="status" className="space-y-3 rounded-lg border border-border bg-muted p-4">
         <h2 className="text-sm font-semibold">Connection retired</h2>
         <p className="text-sm text-muted-foreground">{RETIRED_COMPOSIO_MESSAGE}</p>
@@ -598,6 +612,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
           else setRenaming(false);
         }}
       />
+      <div className={cn("space-y-10", ANALYTICS_MASK_CLASS)}>
 
       {status.tone === "attention" && connection.requiresReauthorization === false && (
         <AccessRetryBanner
@@ -694,7 +709,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
               </p> : null}
               {connection.config?.sourceTemplateKey !== "composio" && isRemoteMcpConnectorMethod(connection.config?.sourceTemplateKey, connection.config?.connectionMethodKey) && <p className="text-sm text-muted-foreground">Paperclip controls access to the tools listed here. App and action permissions inside these tools are managed in {baseAppName}.</p>}
               <PermissionsPanel
-                afterAgentAccess={<>{logoEntry?.agentInstructions && <ConnectionInstructionsSettings key={connection.id} connection={connection} provider={logoEntry.name} template={logoEntry.agentInstructions} canConfigure={grantsQuery.data?.capabilities?.canConfigure ?? false} />}{renderAgentSettings?.(connection)}</>}
+                afterAgentAccess={<>{instructionsTemplate && <ConnectionInstructionsSettings key={connection.id} connection={connection} provider={instructionsTemplate.provider} template={instructionsTemplate.template} canConfigure={grantsQuery.data?.capabilities?.canConfigure ?? false} />}{renderAgentSettings?.(connection)}</>}
                 actions={actionsContent}
                 connectionId={connectionId}
                 capabilities={grantsQuery.data?.capabilities}
@@ -747,6 +762,7 @@ function StandardAppDetail({ renderActions, renderAgentSettings, renderConnectio
               </>}
             </div>
       )}
+      </div>
     </div>
   );
 }
@@ -821,7 +837,7 @@ export function AppDetailHeader({
             </form>
           ) : (
             <div className="flex items-center gap-1.5">
-              <h1 className="truncate text-xl font-bold">{appName}</h1>
+              <h1 className={cn("truncate text-xl font-bold", ANALYTICS_MASK_CLASS)}>{appName}</h1>
               <Button
                 variant="ghost"
                 size="icon"
